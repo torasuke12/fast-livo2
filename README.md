@@ -1,127 +1,200 @@
-# FAST-LIVO2
+# fast-livo2
 
-## ROS 2 Humble Go2W Port
+ROS 2 Humble port of FAST-LIVO2 for the Unitree Go2W integration workspace.
 
-This branch contains a ROS 2 Humble port of FAST-LIVO2 for the `fast-livo2-go2w` workspace. The Go2W runtime path uses:
+This package is intended to be used as the `humble_ws/src/fast-livo2` submodule of `fast-livo2-go2w`. The runtime path is adapted for:
 
-- Hesai XT16 LiDAR as `sensor_msgs/msg/PointCloud2`
-- Go2W body IMU as `sensor_msgs/msg/Imu`
-- Intel RealSense color images from `realsense-ros`
+- Hesai XT16 LiDAR published as `sensor_msgs/msg/PointCloud2`
+- Go2W body IMU published as `sensor_msgs/msg/Imu`
+- Intel RealSense color camera images from `realsense-ros`
 
-Launch files added for this port:
+The upstream FAST-LIVO2 source was ROS Noetic based and targeted a different sensor stack. This package keeps the FAST-LIVO2 algorithm structure while adding ROS 2 Humble node, parameter, launch, message, and sensor integration code for Go2W.
+
+## Status
+
+- ROS distribution: Humble
+- Package name: `fast_livo2`
+- Main executable: `fastlivo2_mapping`
+- Primary config: `config/go2w_fast_livo2.yaml`
+- Primary launch: `launch/go2w_fast_livo2.launch.py`
+- Sensor bringup launch: `launch/go2w_sensors.launch.py`
+
+The package builds in the Docker workspace provided by `fast-livo2-go2w`. The default calibration file contains placeholders and must not be used for evaluation or field operation without replacement.
+
+## Expected Topics
+
+| Stream | Topic | Type | Use |
+| --- | --- | --- | --- |
+| LiDAR | `/hesai_node/points_raw` | `sensor_msgs/msg/PointCloud2` | LIO point cloud input |
+| IMU | `/go2w/imu` | `sensor_msgs/msg/Imu` | Go2W body IMU input |
+| Camera image | `/camera/camera/color/image_raw` | `sensor_msgs/msg/Image` | Visual update input |
+| Camera info | `/camera/camera/color/camera_info` | `sensor_msgs/msg/CameraInfo` | Calibration source, not directly subscribed by FAST-LIVO2 |
+
+The topic names are configured in `config/go2w_fast_livo2.yaml`.
+
+## Repository Layout
+
+```text
+fast-livo2/
+  CMakeLists.txt
+  package.xml
+  config/
+    go2w_fast_livo2.yaml
+    ...
+  include/
+  launch/
+    go2w_fast_livo2.launch.py
+    go2w_sensors.launch.py
+  rviz_cfg/
+  scripts/
+  src/
+```
+
+## Use in fast-livo2-go2w
+
+The recommended public workspace entry point is the parent repository:
 
 ```bash
+git clone --recurse-submodules https://github.com/torasuke12/fast-livo2-go2w.git
+cd fast-livo2-go2w
+docker compose -f docker/docker-compose.yml up -d --build
+docker compose -f docker/docker-compose.yml exec fast-livo2-go2w-humble bash
+```
+
+Inside the container:
+
+```bash
+cd /workspace/fast_livo2_go2w/src/fast-livo2-go2w
+./scripts/build_humble_ws.sh
+```
+
+Run FAST-LIVO2 with sensor bringup:
+
+```bash
+source humble_ws/install/setup.bash
 ros2 launch fast_livo2 go2w_fast_livo2.launch.py
+```
+
+Run FAST-LIVO2 only when LiDAR, IMU, and camera topics are already available:
+
+```bash
+ros2 launch fast_livo2 go2w_fast_livo2.launch.py use_sensor_bringup:=false
+```
+
+Run only the sensor bringup defined by this package:
+
+```bash
 ros2 launch fast_livo2 go2w_sensors.launch.py
 ```
 
-Calibration values in `config/go2w_fast_livo2.yaml` are placeholders. Replace camera intrinsics, LiDAR-IMU extrinsics, LiDAR-camera extrinsics, and timing offsets before field use.
+## Standalone Build
 
-## FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
+This package can also be placed in a normal ROS 2 Humble workspace, but the required sensor packages must be available in the same workspace or installed environment:
 
-### 📢 News
+- `go2w_imu_publisher`
+- `hesai_lidar`
+- `realsense2_camera`
+- `unitree_go` and `unitree_api` dependencies used by the Go2W IMU bridge
 
-- 🔓 **2025-01-23**: Code released!  
-- 🎉 **2024-10-01**: Accepted by **T-RO '24**!  
-- 🚀 **2024-07-02**: Conditionally accepted.
-
-### 📬 Contact
-
-For further inquiries or assistance, please contact [zhengcr@connect.hku.hk](mailto:zhengcr@connect.hku.hk).
-
-## 1. Introduction
-
-FAST-LIVO2 is an efficient and accurate LiDAR-inertial-visual fusion localization and mapping system, demonstrating significant potential for real-time 3D reconstruction and onboard robotic localization in severely degraded environments.
-
-**Developer**: [Chunran Zheng 郑纯然](https://github.com/xuankuzcr)
-
-<div align="center">
-    <img src="pics/Framework.png" width = 100% >
-</div>
-
-### 1.1 Related video
-
-Our accompanying video is now available on [**Bilibili**](https://www.bilibili.com/video/BV1Ezxge7EEi) and [**YouTube**](https://youtu.be/6dF2DzgbtlY).
-
-### 1.2 Related paper
-
-[FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry](https://arxiv.org/pdf/2408.14035)  
-
-[FAST-LIVO2 on Resource-Constrained Platforms](https://arxiv.org/pdf/2501.13876)  
-
-[FAST-LIVO: Fast and Tightly-coupled Sparse-Direct LiDAR-Inertial-Visual Odometry](https://arxiv.org/pdf/2203.00893)
-
-[FAST-Calib: LiDAR-Camera Extrinsic Calibration in One Second](https://www.arxiv.org/pdf/2507.17210)
-
-### 1.3 Our hard-synchronized equipment
-
-We open-source our handheld device, including CAD files, synchronization scheme, STM32 source code, wiring instructions, and sensor ROS driver. Access these resources at this repository: [**LIV_handhold**](https://github.com/xuankuzcr/LIV_handhold).
-
-### 1.4 Our associate dataset: FAST-LIVO2-Dataset
-Our associate dataset [**FAST-LIVO2-Dataset**](https://connecthkuhk-my.sharepoint.com/:f:/g/personal/zhengcr_connect_hku_hk/ErdFNQtjMxZOorYKDTtK4ugBkogXfq1OfDm90GECouuIQA?e=KngY9Z) used for evaluation is also available online.
-
-### 1.5 Our LiDAR-camera calibration method
-The [**FAST-Calib**](https://github.com/hku-mars/FAST-Calib) toolkit is recommended. Its output extrinsic parameters can be directly filled into the YAML file. 
-
-## 2. Prerequisited
-
-### 2.1 Ubuntu and ROS
-
-Ubuntu 18.04~20.04.  [ROS Installation](http://wiki.ros.org/ROS/Installation).
-
-### 2.2 PCL && Eigen && OpenCV
-
-PCL>=1.8, Follow [PCL Installation](https://pointclouds.org/). 
-
-Eigen>=3.3.4, Follow [Eigen Installation](https://eigen.tuxfamily.org/index.php?title=Main_Page).
-
-OpenCV>=4.2, Follow [Opencv Installation](http://opencv.org/).
-
-### 2.3 Sophus
-
-Sophus Installation for the non-templated/double-only version.
+Example:
 
 ```bash
-git clone https://github.com/strasdat/Sophus.git
-cd Sophus
-git checkout a621ff
-mkdir build && cd build && cmake ..
-make
-sudo make install
+mkdir -p ~/humble_ws/src
+cd ~/humble_ws/src
+git clone https://github.com/torasuke12/fast-livo2.git fast-livo2
+
+cd ~/humble_ws
+rosdep install -y -r --from-paths src --ignore-src --rosdistro humble
+colcon build --symlink-install --packages-select fast_livo2 --cmake-args -DCMAKE_BUILD_TYPE=Release
+source install/setup.bash
 ```
 
-### 2.4 Vikit
+For Go2W development, use the parent `fast-livo2-go2w` workspace instead of assembling these dependencies manually.
 
-Vikit contains camera models, some math and interpolation functions that we need. Vikit is a catkin project, therefore, download it into your catkin workspace source folder.
+## Launch Arguments
+
+`go2w_fast_livo2.launch.py`:
+
+| Argument | Default | Description |
+| --- | --- | --- |
+| `params_file` | `config/go2w_fast_livo2.yaml` | FAST-LIVO2 parameter file |
+| `log_level` | `info` | ROS logger level for `fastlivo2_mapping` |
+| `use_sensor_bringup` | `true` | Include `go2w_sensors.launch.py` |
+| `use_hesai` | `true` | Start Hesai LiDAR driver launch |
+| `use_go2w_imu` | `true` | Start Go2W IMU publisher |
+| `use_realsense` | `true` | Start RealSense camera launch |
+| `color_profile` | `640x480x30` | RealSense color stream profile |
+| `enable_depth` | `false` | Enable RealSense depth stream |
+| `enable_rs_imu` | `false` | Enable RealSense IMU streams |
+
+Pass any RealSense selection argument when needed:
 
 ```bash
-# Different from the one used in fast-livo1
-cd catkin_ws/src
-git clone https://github.com/xuankuzcr/rpg_vikit.git 
+ros2 launch fast_livo2 go2w_fast_livo2.launch.py \
+  serial_no:=_123456789 \
+  color_profile:=1280x720x30
 ```
 
-## 3. Build
+Use a calibrated parameter file:
 
-Clone the repository and catkin_make:
-
-```
-cd ~/catkin_ws/src
-git clone https://github.com/hku-mars/FAST-LIVO2
-cd ../
-catkin_make
-source ~/catkin_ws/devel/setup.bash
+```bash
+ros2 launch fast_livo2 go2w_fast_livo2.launch.py \
+  params_file:=/path/to/go2w_fast_livo2_calibrated.yaml
 ```
 
-## 4. Run our examples
+## Calibration
 
-Download FAST-LIVO2-Dataset from [Global-LVBA](https://github.com/xuankuzcr/Global-LVBA) Section IV.
+`config/go2w_fast_livo2.yaml` contains bootstrapping values only. Replace at least these fields before meaningful odometry use:
 
-```
-roslaunch fast_livo mapping_avia.launch
-rosbag play YOUR_DOWNLOADED.bag
-```
+- `camera.cam_fx`, `camera.cam_fy`, `camera.cam_cx`, `camera.cam_cy`
+- `camera.cam_d0` through `camera.cam_d4`
+- `extrin_calib.extrinsic_T`
+- `extrin_calib.extrinsic_R`
+- `extrin_calib.Pcl`
+- `extrin_calib.Rcl`
+- `time_offset.imu_time_offset`
+- `time_offset.img_time_offset`
+- `time_offset.lidar_time_offset`
 
+Frame interpretation:
 
-## 5. License
+- `extrinsic_T` and `extrinsic_R`: LiDAR to Go2W IMU transform used by the LIO state.
+- `Pcl` and `Rcl`: LiDAR to RealSense color camera transform used by visual projection.
+- Camera intrinsics should be taken from `/camera/camera/color/camera_info` for the exact RealSense model, serial number, stream profile, and resolution used at runtime.
 
-The source code of this package is released under the [**GPLv2**](http://www.gnu.org/licenses/) license. For commercial use, please contact me at <zhengcr@connect.hku.hk> and Prof. Fu Zhang at <fuzhang@hku.hk> to discuss an alternative license.
+The default identity extrinsics are placeholders, not a valid Go2W calibration.
+
+## ROS 2 Port Notes
+
+This fork adds or adapts:
+
+- `rclcpp` node setup, parameters, publishers, subscribers, and timers
+- ROS 2 `sensor_msgs`, `nav_msgs`, `geometry_msgs`, and `visualization_msgs` usage
+- `tf2_ros` transform publishing
+- Hesai `PointCloud2` preprocessing path for the Go2W XT16 setup
+- Go2W body IMU input instead of assuming a LiDAR-integrated IMU
+- Minimal vikit-compatible camera utility headers used by FAST-LIVO2
+- RealSense-compatible camera model parameter loading
+
+Livox compatibility structs are kept only so the original preprocessing code can compile. The supported Go2W runtime path uses Hesai `PointCloud2`.
+
+## Known Limitations
+
+- Online calibration is not implemented.
+- The default config is not calibrated for any physical Go2W platform.
+- Time synchronization between Go2W IMU, Hesai LiDAR, and RealSense camera must be validated on the target robot.
+- The primary supported path is Go2W + Hesai XT16 + RealSense. Other upstream launch files and sensor modes are preserved where practical but are not the main tested deployment path.
+
+## Upstream Attribution
+
+This repository is derived from FAST-LIVO2:
+
+- Upstream project: `hku-mars/FAST-LIVO2`
+- Paper: FAST-LIVO2: Fast, Direct LiDAR-Inertial-Visual Odometry
+- Original developer: Chunran Zheng
+
+Keep upstream attribution and licensing when redistributing this package.
+
+## License
+
+FAST-LIVO2 is released under GPLv2. This ROS 2 Humble port keeps the same license declaration in `package.xml` as `GPL-2.0-only`. See `LICENSE` for the full license text.
