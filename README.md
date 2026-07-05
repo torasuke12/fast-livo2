@@ -57,14 +57,14 @@ The recommended public workspace entry point is the parent repository:
 ```bash
 git clone --recurse-submodules https://github.com/torasuke12/fast-livo2-go2w.git
 cd fast-livo2-go2w
-docker compose -f docker/docker-compose.yml up -d --build
-docker compose -f docker/docker-compose.yml exec fast-livo2-go2w-humble bash
+bash docker/robot/build.sh
+bash docker/robot/run.sh
 ```
 
 Inside the container:
 
 ```bash
-cd /workspace/fast_livo2_go2w/src/fast-livo2-go2w
+cd /external
 ./scripts/build_humble_ws.sh
 ```
 
@@ -119,6 +119,7 @@ For Go2W development, use the parent `fast-livo2-go2w` workspace instead of asse
 | --- | --- | --- |
 | `params_file` | `config/go2w_fast_livo2.yaml` | FAST-LIVO2 parameter file |
 | `log_level` | `info` | ROS logger level for `fastlivo2_mapping` |
+| `use_sim_time` | `false` | Use `/clock` for bag reconstruction |
 | `use_sensor_bringup` | `true` | Include `go2w_sensors.launch.py` |
 | `use_hesai` | `true` | Start Hesai LiDAR driver launch |
 | `use_go2w_imu` | `true` | Start Go2W IMU publisher |

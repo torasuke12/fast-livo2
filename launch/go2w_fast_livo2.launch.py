@@ -48,7 +48,10 @@ def generate_launch_description():
         executable="fastlivo2_mapping",
         name="laserMapping",
         output="screen",
-        parameters=[params_file],
+        parameters=[
+            params_file,
+            {"use_sim_time": LaunchConfiguration("use_sim_time")},
+        ],
         arguments=["--ros-args", "--log-level", LaunchConfiguration("log_level")],
     )
 
@@ -60,6 +63,7 @@ def generate_launch_description():
         [
             DeclareLaunchArgument("params_file", default_value=default_params),
             DeclareLaunchArgument("log_level", default_value="info"),
+            DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("use_sensor_bringup", default_value="true"),
             DeclareLaunchArgument("use_hesai", default_value="true"),
             DeclareLaunchArgument("use_go2w_imu", default_value="true"),

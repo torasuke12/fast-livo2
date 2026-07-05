@@ -70,13 +70,18 @@ inline builtin_interfaces::msg::Time stampFromSec(double stamp)
   return msg;
 }
 
+inline builtin_interfaces::msg::Time timeToStamp(const rclcpp::Time &time)
+{
+  builtin_interfaces::msg::Time msg;
+  msg.sec = static_cast<int32_t>(time.nanoseconds() / 1000000000LL);
+  msg.nanosec = static_cast<uint32_t>(time.nanoseconds() % 1000000000LL);
+  return msg;
+}
+
 inline builtin_interfaces::msg::Time nowStamp()
 {
   const auto now = rclcpp::Clock(RCL_ROS_TIME).now();
-  builtin_interfaces::msg::Time msg;
-  msg.sec = static_cast<int32_t>(now.nanoseconds() / 1000000000LL);
-  msg.nanosec = static_cast<uint32_t>(now.nanoseconds() % 1000000000LL);
-  return msg;
+  return timeToStamp(now);
 }
 
 inline builtin_interfaces::msg::Duration durationFromSec(double duration)
