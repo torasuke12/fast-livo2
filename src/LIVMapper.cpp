@@ -1151,6 +1151,7 @@ void LIVMapper::publish_frame_world(const fast_livo2::Publisher &pubLaserCloudFu
 {
   if (pcl_w_wait_pub->empty()) return;
   PointCloudXYZRGB::Ptr laserCloudWorldRGB(new PointCloudXYZRGB());
+  bool rgb_cloud_ready = false;
   static int pub_num = 1;
   pub_num++;
 
@@ -1160,6 +1161,7 @@ void LIVMapper::publish_frame_world(const fast_livo2::Publisher &pubLaserCloudFu
     if(pub_num >= pub_scan_num)
     {
       pub_num = 1;
+      rgb_cloud_ready = true;
       size_t size = pcl_wait_pub->points.size();
       laserCloudWorldRGB->reserve(size);
       // double inv_expo = _state.inv_expo_time;
@@ -1193,11 +1195,11 @@ void LIVMapper::publish_frame_world(const fast_livo2::Publisher &pubLaserCloudFu
 
   /*** Publish Frame ***/
   sensor_msgs::PointCloud2 laserCloudmsg;
-  if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO)
+  if (slam_mode_ == LIVO && LidarMeasures.lio_vio_flg == VIO && !laserCloudWorldRGB->empty())
   {
     pcl::toROSMsg(*laserCloudWorldRGB, laserCloudmsg);
   }
-  if (slam_mode_ == ONLY_LIO || slam_mode_ == ONLY_LO)
+  else
   { 
     pcl::toROSMsg(*pcl_w_wait_pub, laserCloudmsg); 
   }
@@ -1302,7 +1304,7 @@ void LIVMapper::publish_frame_world(const fast_livo2::Publisher &pubLaserCloudFu
     }
   }
 
-  if(laserCloudWorldRGB->size() > 0)  PointCloudXYZI().swap(*pcl_wait_pub); 
+  if(rgb_cloud_ready)  PointCloudXYZI().swap(*pcl_wait_pub);
   if(LidarMeasures.lio_vio_flg == VIO)  PointCloudXYZI().swap(*pcl_w_wait_pub);
 }
 
