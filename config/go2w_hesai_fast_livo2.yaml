@@ -1,0 +1,121 @@
+laserMapping:
+  ros__parameters:
+    common:
+      lid_topic: /hesai_node/points_raw
+      imu_topic: /go2w/imu
+      img_topic: /camera/camera/color/image_raw
+      img_en: 1
+      lidar_en: 1
+      ros_driver_bug_fix: false
+
+    # RealSense color camera placeholder intrinsics.
+    # Replace these with /camera/camera/color/camera_info from the target Go2W.
+    camera:
+      cam_model: RadTan
+      cam_width: 640
+      cam_height: 480
+      scale: 1.0
+      cam_fx: 615.0
+      cam_fy: 615.0
+      cam_cx: 320.0
+      cam_cy: 240.0
+      cam_d0: 0.0
+      cam_d1: 0.0
+      cam_d2: 0.0
+      cam_d3: 0.0
+      cam_d4: 0.0
+
+    # TODO(calibration): these identity transforms are only bootstrapping values.
+    # extrinsic_R/T: LiDAR to Go2W IMU transform used by the LIO state.
+    # Rcl/Pcl: LiDAR to RealSense color camera transform used by visual projection.
+    extrin_calib:
+      extrinsic_T: [0.0, 0.0, 0.0]
+      extrinsic_R: [1.0, 0.0, 0.0,
+                    0.0, 1.0, 0.0,
+                    0.0, 0.0, 1.0]
+      Pcl: [0.0, 0.0, 0.0]
+      Rcl: [1.0, 0.0, 0.0,
+            0.0, 1.0, 0.0,
+            0.0, 0.0, 1.0]
+
+    time_offset:
+      imu_time_offset: 0.0
+      img_time_offset: 0.0
+      lidar_time_offset: 0.0
+      exposure_time_init: 0.0
+
+    preprocess:
+      hilti_en: false
+      point_filter_num: 3
+      filter_size_surf: 0.2
+      lidar_type: 5
+      scan_line: 16
+      blind: 0.3
+      feature_extract_enabled: false
+
+    vio:
+      max_iterations: 5
+      outlier_threshold: 500.0
+      img_point_cov: 1000.0
+      patch_size: 8
+      patch_pyrimid_level: 4
+      grid_size: 5
+      grid_n_height: 17
+      normal_en: true
+      raycast_en: false
+      inverse_composition_en: false
+      exposure_estimate_en: true
+      inv_expo_cov: 0.1
+
+    imu:
+      imu_en: true
+      imu_int_frame: 30
+      acc_cov: 0.5
+      gyr_cov: 0.01
+      gravity_est_en: true
+      ba_bg_est_en: true
+
+    lio:
+      max_iterations: 5
+      dept_err: 0.02
+      beam_err: 0.05
+      min_eigen_value: 0.0001
+      voxel_size: 0.4
+      max_layer: 2
+      max_points_num: 100
+      layer_init_num: [5, 5, 5, 5, 5]
+
+    local_map:
+      map_sliding_en: false
+      half_map_size: 100
+      sliding_thresh: 8.0
+
+    uav:
+      imu_rate_odom: false
+      gravity_align_en: false
+
+    publish:
+      dense_map_en: true
+      pub_effect_point_en: false
+      pub_plane_en: false
+      pub_scan_num: 1
+      blind_rgb_points: 0.0
+
+    evo:
+      seq_name: go2w
+      pose_output_en: false
+
+    pcd_save:
+      pcd_save_en: false
+      type: 0
+      colmap_output_en: false
+      filter_size_pcd: 0.15
+      interval: -1
+
+    image_save:
+      img_save_en: false
+      interval: 1
+
+    debug:
+      plot_time: -10.0
+      frame_cnt: 6

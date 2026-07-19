@@ -34,6 +34,7 @@ find_package(ament_cmake REQUIRED)
 find_package(cv_bridge REQUIRED)
 find_package(Eigen3 REQUIRED)
 find_package(geometry_msgs REQUIRED)
+find_package(livox_ros_driver2 REQUIRED)
 find_package(nav_msgs REQUIRED)
 find_package(OpenCV REQUIRED)
 find_package(OpenMP QUIET)
@@ -52,6 +53,7 @@ find_package(Boost REQUIRED COMPONENTS thread)
 set(FAST_LIVO2_DEPS
   cv_bridge
   geometry_msgs
+  livox_ros_driver2
   nav_msgs
   pcl_conversions
   rclcpp

@@ -201,14 +201,18 @@ void LIVMapper::initializeFiles()
 
 void LIVMapper::initializeSubscribersAndPublishers()
 {
+  auto sensor_qos = rclcpp::SensorDataQoS().keep_last(2000);
   if (p_pre->lidar_type == AVIA)
   {
-    RCLCPP_WARN(node_->get_logger(), "Livox CustomMsg input is not enabled in this Go2W Humble port; subscribing as PointCloud2.");
+    RCLCPP_INFO(node_->get_logger(), "Subscribing to Livox CustomMsg on %s", lid_topic.c_str());
+    sub_livox = node_->create_subscription<livox_ros_driver::CustomMsg>(
+        lid_topic, sensor_qos, std::bind(&LIVMapper::livox_pcl_cbk, this, std::placeholders::_1));
   }
-
-  auto sensor_qos = rclcpp::SensorDataQoS().keep_last(2000);
-  sub_pcl = node_->create_subscription<sensor_msgs::PointCloud2>(
-      lid_topic, sensor_qos, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+  else
+  {
+    sub_pcl = node_->create_subscription<sensor_msgs::PointCloud2>(
+        lid_topic, sensor_qos, std::bind(&LIVMapper::standard_pcl_cbk, this, std::placeholders::_1));
+  }
   sub_imu = node_->create_subscription<sensor_msgs::Imu>(
       imu_topic, sensor_qos, std::bind(&LIVMapper::imu_cbk, this, std::placeholders::_1));
   sub_img = node_->create_subscription<sensor_msgs::Image>(

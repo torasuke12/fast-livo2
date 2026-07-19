@@ -8,11 +8,31 @@ from launch_ros.substitutions import FindPackageShare
 
 
 def generate_launch_description():
+    use_livox = LaunchConfiguration("use_livox")
     use_hesai = LaunchConfiguration("use_hesai")
     use_go2w_imu = LaunchConfiguration("use_go2w_imu")
     use_realsense = LaunchConfiguration("use_realsense")
     enable_depth = LaunchConfiguration("enable_depth")
     enable_rs_imu = LaunchConfiguration("enable_rs_imu")
+
+    livox_launch = IncludeLaunchDescription(
+        PythonLaunchDescriptionSource(
+            PathJoinSubstitution(
+                [FindPackageShare("fast_livo2"), "launch", "go2w_livox_mid360.launch.py"]
+            )
+        ),
+        launch_arguments={
+            "xfer_format": LaunchConfiguration("livox_xfer_format"),
+            "multi_topic": LaunchConfiguration("livox_multi_topic"),
+            "data_src": LaunchConfiguration("livox_data_src"),
+            "publish_freq": LaunchConfiguration("livox_publish_freq"),
+            "output_data_type": LaunchConfiguration("livox_output_data_type"),
+            "frame_id": LaunchConfiguration("livox_frame_id"),
+            "user_config_path": LaunchConfiguration("livox_config"),
+            "cmdline_input_bd_code": LaunchConfiguration("livox_bd_code"),
+        }.items(),
+        condition=IfCondition(use_livox),
+    )
 
     hesai_launch = IncludeLaunchDescription(
         PythonLaunchDescriptionSource(
@@ -64,9 +84,23 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument("use_hesai", default_value="true"),
-            DeclareLaunchArgument("use_go2w_imu", default_value="true"),
+            DeclareLaunchArgument("use_livox", default_value="true"),
+            DeclareLaunchArgument("use_hesai", default_value="false"),
+            DeclareLaunchArgument("use_go2w_imu", default_value="false"),
             DeclareLaunchArgument("use_realsense", default_value="true"),
+            DeclareLaunchArgument(
+                "livox_config",
+                default_value=PathJoinSubstitution(
+                    [FindPackageShare("fast_livo2"), "config", "MID360_config.json"]
+                ),
+            ),
+            DeclareLaunchArgument("livox_xfer_format", default_value="1"),
+            DeclareLaunchArgument("livox_multi_topic", default_value="0"),
+            DeclareLaunchArgument("livox_data_src", default_value="0"),
+            DeclareLaunchArgument("livox_publish_freq", default_value="10.0"),
+            DeclareLaunchArgument("livox_output_data_type", default_value="0"),
+            DeclareLaunchArgument("livox_frame_id", default_value="livox_frame"),
+            DeclareLaunchArgument("livox_bd_code", default_value="livox0000000001"),
             DeclareLaunchArgument("camera_namespace", default_value="camera"),
             DeclareLaunchArgument("camera_name", default_value="camera"),
             DeclareLaunchArgument("serial_no", default_value="''"),
@@ -81,6 +115,7 @@ def generate_launch_description():
             DeclareLaunchArgument("enable_sync", default_value="true"),
             DeclareLaunchArgument("enable_rs_imu", default_value="false"),
             DeclareLaunchArgument("unite_rs_imu_method", default_value="0"),
+            livox_launch,
             hesai_launch,
             go2w_imu_node,
             realsense_launch,

@@ -164,6 +164,7 @@ public:
 
   fast_livo2::Publisher plane_pub;
   fast_livo2::Publisher voxel_pub;
+  rclcpp::Subscription<livox_ros_driver::CustomMsg>::SharedPtr sub_livox;
   rclcpp::Subscription<sensor_msgs::PointCloud2>::SharedPtr sub_pcl;
   rclcpp::Subscription<sensor_msgs::Imu>::SharedPtr sub_imu;
   rclcpp::Subscription<sensor_msgs::Image>::SharedPtr sub_img;
