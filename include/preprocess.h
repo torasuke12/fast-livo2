@@ -15,6 +15,7 @@ which is included as part of this source code package.
 
 #include "common_lib.h"
 #include <livox_ros_driver/CustomMsg.h>
+#include <sensor_msgs/point_cloud2_iterator.hpp>
 #include <pcl_conversions/pcl_conversions.h>
 
 using namespace std;
@@ -176,6 +177,7 @@ private:
   void xt32_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
   void Pandar128_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
   void robosense_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
+  void mid360_pointcloud2_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
   void l515_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg);
   void give_feature(PointCloudXYZI &pl, vector<orgtype> &types);
   void pub_func(PointCloudXYZI &pl, const builtin_interfaces::msg::Time &ct);

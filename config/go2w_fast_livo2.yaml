@@ -49,7 +49,7 @@ laserMapping:
       hilti_en: false
       point_filter_num: 3
       filter_size_surf: 0.5
-      lidar_type: 1
+      lidar_type: 8
       scan_line: 4
       blind: 0.5
       feature_extract_enabled: false

@@ -84,7 +84,7 @@ def generate_launch_description():
                     [FindPackageShare("fast_livo2"), "config", "MID360_config.json"]
                 ),
             ),
-            DeclareLaunchArgument("livox_xfer_format", default_value="1"),
+            DeclareLaunchArgument("livox_xfer_format", default_value="0"),
             DeclareLaunchArgument("livox_multi_topic", default_value="0"),
             DeclareLaunchArgument("livox_data_src", default_value="0"),
             DeclareLaunchArgument("livox_publish_freq", default_value="10.0"),

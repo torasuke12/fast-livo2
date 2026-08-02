@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "preprocess.h"
 
+#include <cmath>
+
 #define RETURN0 0x00
 #define RETURN0AND1 0x10
 
@@ -83,6 +85,10 @@ void Preprocess::process(const sensor_msgs::PointCloud2::ConstSharedPtr &msg, Po
 
   case ROBOSENSE:
     robosense_handler(msg);
+    break;
+
+  case MID360_POINTCLOUD2:
+    mid360_pointcloud2_handler(msg);
     break;
 
   default:
@@ -238,6 +244,60 @@ void Preprocess::l515_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &ms
   cout << "pl size:: " << pl_orig.points.size() << endl;
   // pub_func(pl_surf, pub_full, msg->header.stamp);
   // pub_func(pl_surf, pub_corn, msg->header.stamp);
+}
+
+void Preprocess::mid360_pointcloud2_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
+{
+  pl_surf.clear();
+  pl_corn.clear();
+  pl_full.clear();
+
+  const int plsize = static_cast<int>(msg->width * msg->height);
+  pl_full.resize(plsize);
+  pl_surf.reserve(plsize);
+
+  sensor_msgs::PointCloud2ConstIterator<float> iter_x(*msg, "x");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_y(*msg, "y");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_z(*msg, "z");
+  sensor_msgs::PointCloud2ConstIterator<float> iter_intensity(*msg, "intensity");
+  sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_line(*msg, "line");
+  sensor_msgs::PointCloud2ConstIterator<double> iter_timestamp(*msg, "timestamp");
+
+  uint valid_num = 0;
+  bool has_last_curvature = false;
+  double last_curvature = 0.0;
+  for (int i = 0; i < plsize;
+       ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_intensity, ++iter_line, ++iter_timestamp)
+  {
+    if (*iter_line >= N_SCANS) continue;
+
+    valid_num++;
+    pl_full[i].x = *iter_x;
+    pl_full[i].y = *iter_y;
+    pl_full[i].z = *iter_z;
+    pl_full[i].intensity = *iter_intensity;
+    pl_full[i].curvature = *iter_timestamp / 1000000.0;
+
+    if (!has_last_curvature)
+    {
+      pl_full[i].curvature = fabs(pl_full[i].curvature) < 1.0 ? pl_full[i].curvature : 0.0;
+      has_last_curvature = true;
+    }
+    else
+    {
+      pl_full[i].curvature = fabs(pl_full[i].curvature - last_curvature) < 1.0
+                                 ? pl_full[i].curvature
+                                 : last_curvature + 0.004166667f;
+    }
+    last_curvature = pl_full[i].curvature;
+
+    if (valid_num % point_filter_num != 0) continue;
+    const double range = pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z;
+    if (range < blind_sqr) continue;
+    if (!std::isfinite(pl_full[i].x) || !std::isfinite(pl_full[i].y) || !std::isfinite(pl_full[i].z)) continue;
+
+    pl_surf.push_back(pl_full[i]);
+  }
 }
 
 void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)

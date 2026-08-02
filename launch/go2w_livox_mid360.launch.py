@@ -32,7 +32,7 @@ def generate_launch_description():
 
     return LaunchDescription(
         [
-            DeclareLaunchArgument("xfer_format", default_value="1"),
+            DeclareLaunchArgument("xfer_format", default_value="0"),
             DeclareLaunchArgument("multi_topic", default_value="0"),
             DeclareLaunchArgument("data_src", default_value="0"),
             DeclareLaunchArgument("publish_freq", default_value="10.0"),
