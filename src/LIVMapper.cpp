@@ -54,8 +54,8 @@ LIVMapper::~LIVMapper() {}
 
 void LIVMapper::readParameters()
 {
-  lid_topic = fast_livo2::declareOrGet<string>(node_, "common/lid_topic", "/hesai_node/points_raw");
-  imu_topic = fast_livo2::declareOrGet<string>(node_, "common/imu_topic", "/go2w/imu");
+  lid_topic = fast_livo2::declareOrGet<string>(node_, "common/lid_topic", "/livox/lidar");
+  imu_topic = fast_livo2::declareOrGet<string>(node_, "common/imu_topic", "/livox/imu");
   ros_driver_fix_en = fast_livo2::declareOrGet<bool>(node_, "common/ros_driver_bug_fix", false);
   img_en = fast_livo2::declareOrGet<int>(node_, "common/img_en", 1);
   lidar_en = fast_livo2::declareOrGet<int>(node_, "common/lidar_en", 1);
@@ -93,8 +93,8 @@ void LIVMapper::readParameters()
   p_pre->blind = fast_livo2::declareOrGet<double>(node_, "preprocess/blind", 0.01);
   filter_size_surf_min = fast_livo2::declareOrGet<double>(node_, "preprocess/filter_size_surf", 0.5);
   hilti_en = fast_livo2::declareOrGet<bool>(node_, "preprocess/hilti_en", false);
-  p_pre->lidar_type = fast_livo2::declareOrGet<int>(node_, "preprocess/lidar_type", XT32);
-  p_pre->N_SCANS = fast_livo2::declareOrGet<int>(node_, "preprocess/scan_line", 16);
+  p_pre->lidar_type = fast_livo2::declareOrGet<int>(node_, "preprocess/lidar_type", MID360_POINTCLOUD2);
+  p_pre->N_SCANS = fast_livo2::declareOrGet<int>(node_, "preprocess/scan_line", 4);
   p_pre->point_filter_num = fast_livo2::declareOrGet<int>(node_, "preprocess/point_filter_num", 3);
   p_pre->feature_enabled = fast_livo2::declareOrGet<bool>(node_, "preprocess/feature_extract_enabled", false);
 
