@@ -12,6 +12,25 @@ which is included as part of this source code package.
 
 #include "vio.h"
 
+#include <Eigen/SVD>
+
+namespace
+{
+M3D projectToSO3(const M3D &rot)
+{
+  Eigen::JacobiSVD<M3D> svd(rot, Eigen::ComputeFullU | Eigen::ComputeFullV);
+  M3D u = svd.matrixU();
+  const M3D v = svd.matrixV();
+  M3D projected = u * v.transpose();
+  if (projected.determinant() < 0.0)
+  {
+    u.col(2) *= -1.0;
+    projected = u * v.transpose();
+  }
+  return projected;
+}
+} // namespace
+
 VIOManager::VIOManager()
 {
   // downSizeFilter.setLeafSize(0.2, 0.2, 0.2);
@@ -28,13 +47,15 @@ VIOManager::~VIOManager()
 
 void VIOManager::setImuToLidarExtrinsic(const V3D &transl, const M3D &rot)
 {
-  Pli = -rot.transpose() * transl;
-  Rli = rot.transpose();
+  const M3D rot_projected = projectToSO3(rot);
+  Pli = -rot_projected.transpose() * transl;
+  Rli = rot_projected.transpose();
 }
 
 void VIOManager::setLidarToCameraExtrinsic(vector<double> &R, vector<double> &P)
 {
   Rcl << MAT_FROM_ARRAY(R);
+  Rcl = projectToSO3(Rcl);
   Pcl << VEC_FROM_ARRAY(P);
 }
 
@@ -1689,10 +1710,10 @@ void VIOManager::updateState(cv::Mat img, int level)
 
 void VIOManager::updateFrameState(StatesGroup state)
 {
-  M3D Rwi(state.rot_end);
+  M3D Rwi(projectToSO3(state.rot_end));
   V3D Pwi(state.pos_end);
-  Rcw = Rci * Rwi.transpose();
-  Pcw = -Rci * Rwi.transpose() * Pwi + Pci;
+  Rcw = projectToSO3(Rci * Rwi.transpose());
+  Pcw = -Rcw * Pwi + Pci;
   new_frame_->T_f_w_ = SE3(Rcw, Pcw);
 }
 
