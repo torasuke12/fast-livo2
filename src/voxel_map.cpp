@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+#include <cstdlib>
+
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
   if (pb[2] == 0) pb[2] = 0.0001;
@@ -662,7 +664,7 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
     useful_ptpl[i] = false;
   }
   #ifdef MP_EN
-    omp_set_num_threads(MP_PROC_NUM);
+    omp_set_num_threads(std::getenv("FAST_LIVO2_DETERMINISTIC") != nullptr ? 1 : MP_PROC_NUM);
     #pragma omp parallel for
   #endif
   for (int i = 0; i < index.size(); i++)

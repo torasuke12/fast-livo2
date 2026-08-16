@@ -57,6 +57,7 @@ void LIVMapper::readParameters()
   lid_topic = fast_livo2::declareOrGet<string>(node_, "common/lid_topic", "/livox/lidar");
   imu_topic = fast_livo2::declareOrGet<string>(node_, "common/imu_topic", "/livox/imu");
   ros_driver_fix_en = fast_livo2::declareOrGet<bool>(node_, "common/ros_driver_bug_fix", false);
+  reliable_sensor_qos = fast_livo2::declareOrGet<bool>(node_, "common/reliable_sensor_qos", false);
   img_en = fast_livo2::declareOrGet<int>(node_, "common/img_en", 1);
   lidar_en = fast_livo2::declareOrGet<int>(node_, "common/lidar_en", 1);
   img_topic = fast_livo2::declareOrGet<string>(node_, "common/img_topic", "/camera/camera/color/image_raw");
@@ -202,6 +203,10 @@ void LIVMapper::initializeFiles()
 void LIVMapper::initializeSubscribersAndPublishers()
 {
   auto sensor_qos = rclcpp::SensorDataQoS().keep_last(2000);
+  if (reliable_sensor_qos) sensor_qos.reliable();
+  RCLCPP_INFO(
+      node_->get_logger(), "Sensor subscription reliability: %s",
+      reliable_sensor_qos ? "RELIABLE" : "BEST_EFFORT");
   if (p_pre->lidar_type == AVIA)
   {
     RCLCPP_INFO(node_->get_logger(), "Subscribing to Livox CustomMsg on %s", lid_topic.c_str());
@@ -799,7 +804,11 @@ void LIVMapper::imu_cbk(const sensor_msgs::Imu::ConstSharedPtr &msg_in)
 
   if (fabs(last_timestamp_lidar - timestamp) > 0.5 && (!ros_driver_fix_en))
   {
-    ROS_WARN("IMU and LiDAR not synced! delta time: %lf .\n", last_timestamp_lidar - timestamp);
+    RCLCPP_WARN_THROTTLE(
+        node_->get_logger(), *node_->get_clock(), 2000,
+        "IMU and LiDAR callback processing skew: delta time %.6f s. "
+        "Offline playback may be running faster than mapping can consume it.",
+        last_timestamp_lidar - timestamp);
   }
 
   if (ros_driver_fix_en) timestamp += std::round(last_timestamp_lidar - timestamp);

@@ -8,17 +8,17 @@ laserMapping:
       lidar_en: 1
       ros_driver_bug_fix: false
 
-    # RealSense color camera placeholder intrinsics.
-    # Replace these with /camera/camera/color/camera_info from the target Go2W.
+    # RealSense color intrinsics recorded on /camera/camera/color/camera_info.
+    # These values are identical in the raw_20260802 and raw_20260809 bags.
     camera:
       cam_model: RadTan
       cam_width: 640
       cam_height: 480
       scale: 1.0
-      cam_fx: 615.0
-      cam_fy: 615.0
-      cam_cx: 320.0
-      cam_cy: 240.0
+      cam_fx: 607.067810
+      cam_fy: 607.022583
+      cam_cx: 313.942291
+      cam_cy: 253.383209
       cam_d0: 0.0
       cam_d1: 0.0
       cam_d2: 0.0

@@ -13,6 +13,7 @@ which is included as part of this source code package.
 #include "vio.h"
 
 #include <Eigen/SVD>
+#include <cstdlib>
 
 namespace
 {
@@ -1072,7 +1073,7 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
       double cos_angle = pf.dot(norm_vec);
       // if(fabs(cos_angle) < 0.86) continue; // 20 degree
 
-      float ref_mean;
+      float ref_mean = ref_patch_temp->mean_;
       if (abs(ref_patch_temp->mean_) < 1e-6)
       {
         float ref_sum = std::accumulate(patch_temp, patch_temp + patch_size_total, 0.0);
@@ -1085,7 +1086,7 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
         if ((*itm)->id_ == ref_patch_temp->id_) continue;
         float *patch_cache = (*itm)->patch_;
 
-        float other_mean;
+        float other_mean = (*itm)->mean_;
         if (abs((*itm)->mean_) < 1e-6)
         {
           float other_sum = std::accumulate(patch_cache, patch_cache + patch_size_total, 0.0);
@@ -1103,7 +1104,7 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
         count++;
       }
 
-      NCC = NCC / count;
+      if (count > 0) NCC = NCC / count;
 
       score = NCC + cos_angle;
 
@@ -1571,7 +1572,7 @@ void VIOManager::updateState(cv::Mat img, int level)
     // omp_set_num_threads(desired_threads);
   
     #ifdef MP_EN
-      omp_set_num_threads(MP_PROC_NUM);
+      omp_set_num_threads(std::getenv("FAST_LIVO2_DETERMINISTIC") != nullptr ? 1 : MP_PROC_NUM);
       #pragma omp parallel for reduction(+:error, n_meas)
     #endif
     for (int i = 0; i < total_points; i++)
