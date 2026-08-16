@@ -65,6 +65,9 @@ def generate_launch_description():
                 "common.reliable_sensor_qos": ParameterValue(
                     LaunchConfiguration("reliable_sensor_qos"), value_type=bool
                 ),
+                "common.img_en": ParameterValue(
+                    LaunchConfiguration("img_en"), value_type=int
+                ),
             },
         ],
         arguments=["--ros-args", "--log-level", LaunchConfiguration("log_level")],
@@ -80,6 +83,11 @@ def generate_launch_description():
             DeclareLaunchArgument("log_level", default_value="info"),
             DeclareLaunchArgument("use_sim_time", default_value="false"),
             DeclareLaunchArgument("reliable_sensor_qos", default_value="false"),
+            DeclareLaunchArgument(
+                "img_en",
+                default_value="1",
+                description="Set to 0 to disable VIO and run LIO-only mode",
+            ),
             DeclareLaunchArgument("use_sensor_bringup", default_value="true"),
             DeclareLaunchArgument("use_livox", default_value="true"),
             DeclareLaunchArgument("use_hesai", default_value="false"),

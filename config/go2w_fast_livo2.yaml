@@ -34,12 +34,13 @@ laserMapping:
       extrinsic_R: [1.0, 0.0, 0.0,
                     0.0, 1.0, 0.0,
                     0.0, 0.0, 1.0]
-      # Provisional value derived from base_link -> camera_color_optical_frame
-      # [0.30, 0.0, 0.05, 0.0, 0.0, 0.0] and the fastlio-go2w MID360 mount.
-      Pcl: [-0.089, 0.0, 0.1508]
-      Rcl: [0.949546, 0.0, 0.313628,
-            0.0, 1.0, 0.0,
-            -0.313628, 0.0, 0.949546]
+      # Provisional value derived from a forward-facing standard optical frame
+      # at base_link pose [0.30, 0.0, 0.05, -pi/2, 0.0, -pi/2] and the
+      # fastlio-go2w MID360 mount. Replace it with measured calibration.
+      Pcl: [0.0, -0.1508, -0.089]
+      Rcl: [0.0, -1.0, 0.0,
+            0.313628, 0.0, -0.949546,
+            0.949546, 0.0, 0.313628]
 
     time_offset:
       imu_time_offset: 0.0
