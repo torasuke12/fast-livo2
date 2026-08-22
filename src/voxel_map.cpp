@@ -12,7 +12,41 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 
+#include <algorithm>
 #include <cstdlib>
+
+namespace
+{
+VOXEL_LOCATION worldToVoxelLocation(const Eigen::Vector3d &point, const double voxel_size)
+{
+  return VOXEL_LOCATION(static_cast<int64_t>(std::floor(point.x() / voxel_size)),
+                        static_cast<int64_t>(std::floor(point.y() / voxel_size)),
+                        static_cast<int64_t>(std::floor(point.z() / voxel_size)));
+}
+
+M3D so3RetractionJacobian(const V3D &delta)
+{
+  const double squared_norm = delta.squaredNorm();
+  if (squared_norm < 1e-16) return M3D::Identity();
+
+  const double norm = std::sqrt(squared_norm);
+  M3D delta_hat;
+  delta_hat << SKEW_SYM_MATRX(delta);
+  return M3D::Identity() + (1.0 - std::cos(norm)) / squared_norm * delta_hat +
+         (1.0 - std::sin(norm) / norm) / squared_norm * delta_hat * delta_hat;
+}
+
+M3D gravityTangentTransport(const V3D &from_gravity, const V3D &to_gravity)
+{
+  if (from_gravity.norm() < 1e-9 || to_gravity.norm() < 1e-9) return M3D::Identity();
+
+  const V3D from_unit = from_gravity.normalized();
+  const V3D to_unit = to_gravity.normalized();
+  const Eigen::Quaterniond rotation = Eigen::Quaterniond::FromTwoVectors(from_unit, to_unit);
+  const M3D to_tangent = M3D::Identity() - to_unit * to_unit.transpose();
+  return to_tangent * rotation.toRotationMatrix();
+}
+} // namespace
 
 void calcBodyCov(Eigen::Vector3d &pb, const float range_inc, const float degree_inc, Eigen::Matrix3d &cov)
 {
@@ -43,6 +77,31 @@ void loadVoxelConfig(const rclcpp::Node::SharedPtr &node, VoxelMapConfig &voxel_
   voxel_config.max_voxel_size_ = fast_livo2::declareOrGet<double>(node, "lio/voxel_size", 0.5);
   voxel_config.planner_threshold_ = fast_livo2::declareOrGet<double>(node, "lio/min_eigen_value", 0.01);
   voxel_config.sigma_num_ = fast_livo2::declareOrGet<double>(node, "lio/sigma_num", 3.0);
+  voxel_config.max_state_cov_for_matching_ = fast_livo2::declareOrGet<double>(node, "lio/max_state_cov_for_matching", 0.01);
+  if (voxel_config.max_state_cov_for_matching_ <= 0.0) voxel_config.max_state_cov_for_matching_ = 0.01;
+  voxel_config.neighbor_voxel_radius_ = fast_livo2::declareOrGet<int>(node, "lio/neighbor_voxel_radius", 1);
+  if (voxel_config.neighbor_voxel_radius_ < 0) voxel_config.neighbor_voxel_radius_ = 0;
+  voxel_config.correspondence_mode_ = fast_livo2::declareOrGet<std::string>(node, "lio/correspondence_mode", "fastlio_knn");
+  if (voxel_config.correspondence_mode_ != "fastlio_knn" && voxel_config.correspondence_mode_ != "voxel_plane")
+  {
+    RCLCPP_WARN(node->get_logger(), "Unknown lio/correspondence_mode '%s'; using fastlio_knn",
+                voxel_config.correspondence_mode_.c_str());
+    voxel_config.correspondence_mode_ = "fastlio_knn";
+  }
+  voxel_config.knn_num_match_points_ = fast_livo2::declareOrGet<int>(node, "lio/knn_num_match_points", 5);
+  if (voxel_config.knn_num_match_points_ < 3) voxel_config.knn_num_match_points_ = 5;
+  voxel_config.knn_max_neighbor_sq_dist_ = fast_livo2::declareOrGet<double>(node, "lio/knn_max_neighbor_sq_dist", 5.0);
+  if (voxel_config.knn_max_neighbor_sq_dist_ <= 0.0) voxel_config.knn_max_neighbor_sq_dist_ = 5.0;
+  voxel_config.knn_plane_threshold_ = fast_livo2::declareOrGet<double>(node, "lio/knn_plane_threshold", 0.1);
+  if (voxel_config.knn_plane_threshold_ <= 0.0) voxel_config.knn_plane_threshold_ = 0.1;
+  voxel_config.knn_residual_score_threshold_ = fast_livo2::declareOrGet<double>(node, "lio/knn_residual_score_threshold", 0.9);
+  voxel_config.knn_map_voxel_size_ = fast_livo2::declareOrGet<double>(node, "lio/knn_map_voxel_size", 0.5);
+  if (voxel_config.knn_map_voxel_size_ <= 0.0) voxel_config.knn_map_voxel_size_ = 0.5;
+  voxel_config.knn_laser_point_cov_ = fast_livo2::declareOrGet<double>(node, "lio/knn_laser_point_cov", 0.001);
+  if (voxel_config.knn_laser_point_cov_ <= 0.0) voxel_config.knn_laser_point_cov_ = 0.001;
+  voxel_config.gravity_norm_constraint_ =
+      fast_livo2::declareOrGet<bool>(node, "lio/gravity_norm_constraint", true);
+  RCLCPP_INFO(node->get_logger(), "LIO correspondence mode: %s", voxel_config.correspondence_mode_.c_str());
   voxel_config.beam_err_ = fast_livo2::declareOrGet<double>(node, "lio/beam_err", 0.02);
   voxel_config.dept_err_ = fast_livo2::declareOrGet<double>(node, "lio/dept_err", 0.05);
   const auto layer_init_num = fast_livo2::declareOrGet<std::vector<int64_t>>(node, "lio/layer_init_num", {5, 5, 5, 5, 5});
@@ -377,13 +436,18 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   I_STATE.setIdentity();
 
   bool flg_EKF_inited, flg_EKF_converged, EKF_stop_flg = 0;
-  for (int iterCount = 0; iterCount < config_setting_.max_iterations_; iterCount++)
+  bool recompute_knn_neighbors = true;
+  const MD(DIM_STATE, DIM_STATE) propagated_covariance = state_propagat.cov;
+  knn_nearest_indices_.assign(feats_down_size_, {});
+  knn_neighbor_valid_.assign(feats_down_size_, 0);
+  // FAST-LIO's IKFoM update loops from -1 through max_iterations - 1.
+  for (int iterCount = -1; iterCount < config_setting_.max_iterations_; iterCount++)
   {
     double total_residual = 0.0;
     pcl::PointCloud<pcl::PointXYZI>::Ptr world_lidar(new pcl::PointCloud<pcl::PointXYZI>);
     TransformLidar(state_.rot_end, state_.pos_end, feats_down_body_, world_lidar);
-    M3D rot_var = state_.cov.block<3, 3>(0, 0);
-    M3D t_var = state_.cov.block<3, 3>(3, 3);
+    const M3D rot_var = boundedStateCovarianceBlock(0);
+    const M3D t_var = boundedStateCovarianceBlock(3);
     for (size_t i = 0; i < feats_down_body_->size(); i++)
     {
       pointWithVar &pv = pv_list_[i];
@@ -400,7 +464,14 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
     // double t1 = omp_get_wtime();
 
-    BuildResidualListOMP(pv_list_, ptpl_list_);
+    if (config_setting_.correspondence_mode_ == "fastlio_knn")
+    {
+      BuildResidualListKNN(pv_list_, ptpl_list_, recompute_knn_neighbors);
+    }
+    else
+    {
+      BuildResidualListOMP(pv_list_, ptpl_list_);
+    }
 
     // build_residual_time += omp_get_wtime() - t1;
 
@@ -410,7 +481,9 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     }
     effct_feat_num_ = ptpl_list_.size();
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
-         << " effective feature num: " << effct_feat_num_ << " average residual: " << total_residual / effct_feat_num_ << endl;
+         << " effective feature num: " << effct_feat_num_ << " average residual: "
+         << (effct_feat_num_ > 0 ? total_residual / effct_feat_num_ : 0.0) << endl;
+    if (effct_feat_num_ < 1) break;
 
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
@@ -454,7 +527,15 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
       double sigma_l = J_nq * ptpl_list_[i].plane_var_ * J_nq.transpose();
 
-      R_inv(i) = 1.0 / (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
+      if (config_setting_.correspondence_mode_ == "fastlio_knn")
+      {
+        // FAST-LIO uses a constant LASER_POINT_COV for all accepted point-to-plane residuals.
+        R_inv(i) = 1.0 / config_setting_.knn_laser_point_cov_;
+      }
+      else
+      {
+        R_inv(i) = 1.0 / (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
+      }
       // R_inv(i) = 1.0 / (sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
 
       /*** calculate the Measuremnt Jacobian matrix H ***/
@@ -472,30 +553,82 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     auto &&HTz = Hsub_T_R_inv * meas_vec;
     // fout_dbg<<"HTz: "<<HTz<<endl;
     H_T_H.block<6, 6>(0, 0) = Hsub_T_R_inv * Hsub;
+    // IKFoM expresses the propagated covariance in the tangent space of the
+    // current iterated state before computing each gain.  This is essential
+    // for SO(3), and for gravity whose state lies on S2.
+    const auto propagated_to_current_delta = state_ - state_propagat;
+    MD(DIM_STATE, DIM_STATE) propagated_to_current = MD(DIM_STATE, DIM_STATE)::Identity();
+    propagated_to_current.block<3, 3>(0, 0) =
+        so3RetractionJacobian(propagated_to_current_delta.block<3, 1>(0, 0)).transpose();
+    if (config_setting_.gravity_norm_constraint_)
+    {
+      propagated_to_current.block<3, 3>(16, 16) =
+          gravityTangentTransport(state_propagat.gravity, state_.gravity);
+    }
+    MD(DIM_STATE, DIM_STATE) iteration_covariance =
+        propagated_to_current * propagated_covariance * propagated_to_current.transpose();
+    if (config_setting_.gravity_norm_constraint_ && state_.gravity.norm() > 1e-9)
+    {
+      const V3D gravity_unit = state_.gravity.normalized();
+      iteration_covariance.block<3, 3>(16, 16) += gravity_unit * gravity_unit.transpose() * 1e-8;
+    }
+    iteration_covariance = 0.5 * (iteration_covariance + iteration_covariance.transpose());
     // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
-    MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + state_.cov.block<DIM_STATE, DIM_STATE>(0, 0).inverse()).inverse();
+    MD(DIM_STATE, DIM_STATE) &&K_1 =
+        (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + iteration_covariance.inverse()).inverse();
     G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
     auto vec = state_propagat - state_;
+    vec.block<3, 1>(0, 0) =
+        -propagated_to_current.block<3, 3>(0, 0) * propagated_to_current_delta.block<3, 1>(0, 0);
+    if (config_setting_.gravity_norm_constraint_ && state_.gravity.norm() > 1e-9)
+    {
+      const V3D gravity_unit = state_.gravity.normalized();
+      vec.block<3, 1>(16, 0) =
+          (M3D::Identity() - gravity_unit * gravity_unit.transpose()) * (state_propagat.gravity - state_.gravity);
+    }
     VD(DIM_STATE)
     solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
     int minRow, minCol;
+    if (config_setting_.gravity_norm_constraint_ && state_.gravity.norm() > 1e-9)
+    {
+      // FAST-LIO represents gravity on S2. Remove the unobservable radial
+      // component before applying this Euclidean error-state correction.
+      const V3D gravity_unit = state_.gravity.normalized();
+      V3D gravity_delta = solution.block<3, 1>(16, 0);
+      gravity_delta -= gravity_unit * gravity_unit.dot(gravity_delta);
+      solution.block<3, 1>(16, 0) = gravity_delta;
+    }
+    const V3D gravity_before_update = state_.gravity;
     state_ += solution;
-    auto rot_add = solution.block<3, 1>(0, 0);
-    auto t_add = solution.block<3, 1>(3, 0);
-    if ((rot_add.norm() * 57.3 < 0.01) && (t_add.norm() * 100 < 0.015)) { flg_EKF_converged = true; }
+    constrainGravityState(false);
+    // FAST-LIO declares convergence only when every error-state component is
+    // within 0.001. This also controls when nearest neighbors are searched again.
+    flg_EKF_converged = (solution.array().abs() <= 0.001).all();
     V3D euler_cur = state_.rot_end.eulerAngles(2, 1, 0);
 
     /*** Rematch Judgement ***/
 
-    if (flg_EKF_converged || ((rematch_num == 0) && (iterCount == (config_setting_.max_iterations_ - 2)))) { rematch_num++; }
+    const bool force_final_rematch =
+        (rematch_num == 0) && (iterCount == (config_setting_.max_iterations_ - 2));
+    recompute_knn_neighbors = flg_EKF_converged || force_final_rematch;
+    if (recompute_knn_neighbors) { rematch_num++; }
 
     /*** Convergence Judgements and Covariance Update ***/
     if (!EKF_stop_flg && (rematch_num >= 2 || (iterCount == config_setting_.max_iterations_ - 1)))
     {
       /*** Covariance Update ***/
       // _state.cov = (I_STATE - G) * _state.cov;
-      state_.cov.block<DIM_STATE, DIM_STATE>(0, 0) =
-          (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) * state_.cov.block<DIM_STATE, DIM_STATE>(0, 0);
+      MD(DIM_STATE, DIM_STATE) update_transport = MD(DIM_STATE, DIM_STATE)::Identity();
+      update_transport.block<3, 3>(0, 0) = so3RetractionJacobian(solution.block<3, 1>(0, 0)).transpose();
+      if (config_setting_.gravity_norm_constraint_)
+      {
+        update_transport.block<3, 3>(16, 16) = gravityTangentTransport(gravity_before_update, state_.gravity);
+      }
+      state_.cov = update_transport *
+                   (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) *
+                   iteration_covariance * update_transport.transpose();
+      state_.cov = 0.5 * (state_.cov + state_.cov.transpose());
+      constrainGravityState(true);
       // total_distance += (_state.pos_end - position_last).norm();
       position_last_ = state_.pos_end;
       geoQuat_ = tf::createQuaternionMsgFromRollPitchYaw(euler_cur(0), euler_cur(1), euler_cur(2));
@@ -516,6 +649,41 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
   // cout << "[ Mapping ] ekf_time: " << ekf_time << "s, build_residual_time: " << build_residual_time << "s" << endl;
   // cout << "[ Mapping ] ave_ekf_time: " << ave_ekf_time << "s, ave_build_residual_time: " << ave_build_residual_time << "s" << endl;
+}
+
+void VoxelMapManager::constrainGravityState(const bool project_covariance)
+{
+  if (!config_setting_.gravity_norm_constraint_) return;
+
+  const double gravity_norm = state_.gravity.norm();
+  if (!std::isfinite(gravity_norm) || gravity_norm < 1e-9) return;
+
+  const V3D gravity_unit = state_.gravity / gravity_norm;
+  state_.gravity = gravity_unit * G_m_s2;
+  if (!project_covariance) return;
+
+  // Embed S2's two-dimensional tangent covariance in the existing 3D state.
+  // A tiny radial variance keeps the legacy 19x19 information matrix invertible.
+  const M3D tangent_projector = M3D::Identity() - gravity_unit * gravity_unit.transpose();
+  MD(DIM_STATE, DIM_STATE) state_projector = MD(DIM_STATE, DIM_STATE)::Identity();
+  state_projector.block<3, 3>(16, 16) = tangent_projector;
+  state_.cov = state_projector * state_.cov * state_projector.transpose();
+  state_.cov.block<3, 3>(16, 16) += gravity_unit * gravity_unit.transpose() * 1e-8;
+  state_.cov = 0.5 * (state_.cov + state_.cov.transpose());
+}
+
+M3D VoxelMapManager::boundedStateCovarianceBlock(const int start_index) const
+{
+  const M3D covariance = 0.5 * (state_.cov.block<3, 3>(start_index, start_index) +
+                                state_.cov.block<3, 3>(start_index, start_index).transpose());
+  Eigen::SelfAdjointEigenSolver<M3D> solver(covariance);
+  if (solver.info() != Eigen::Success)
+  {
+    return M3D::Identity() * config_setting_.max_state_cov_for_matching_;
+  }
+
+  const V3D eigenvalues = solver.eigenvalues().cwiseMax(0.0).cwiseMin(config_setting_.max_state_cov_for_matching_);
+  return solver.eigenvectors() * eigenvalues.asDiagonal() * solver.eigenvectors().transpose();
 }
 
 void VoxelMapManager::TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud,
@@ -546,6 +714,8 @@ void VoxelMapManager::BuildVoxelMap()
   std::vector<int> layer_init_num = config_setting_.layer_init_num_;
 
   std::vector<pointWithVar> input_points;
+  const M3D rot_var = boundedStateCovarianceBlock(0);
+  const M3D t_var = boundedStateCovarianceBlock(3);
 
   for (size_t i = 0; i < feats_down_world_->size(); i++)
   {
@@ -557,7 +727,7 @@ void VoxelMapManager::BuildVoxelMap()
     M3D point_crossmat;
     point_crossmat << SKEW_SYM_MATRX(point_this);
     var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +
-          (-point_crossmat) * state_.cov.block<3, 3>(0, 0) * (-point_crossmat).transpose() + state_.cov.block<3, 3>(3, 3);
+          (-point_crossmat) * rot_var * (-point_crossmat).transpose() + t_var;
     pv.var = var;
     input_points.push_back(pv);
   }
@@ -566,13 +736,7 @@ void VoxelMapManager::BuildVoxelMap()
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = p_v.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    const VOXEL_LOCATION position = worldToVoxelLocation(p_v.point_w, voxel_size);
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end())
     {
@@ -596,18 +760,14 @@ void VoxelMapManager::BuildVoxelMap()
   {
     iter->second->init_octo_tree();
   }
+
+  UpdateKnnPointMap(feats_down_world_);
 }
 
 V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
 {
-  int64_t loc_xyz[3];
-  for (int j = 0; j < 3; j++)
-  {
-    loc_xyz[j] = floor(input_point[j] / config_setting_.max_voxel_size_);
-  }
-
-  VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
-  int64_t ind = loc_xyz[0] + loc_xyz[1] + loc_xyz[2];
+  const VOXEL_LOCATION position = worldToVoxelLocation(input_point, config_setting_.max_voxel_size_);
+  int64_t ind = position.x + position.y + position.z;
   uint k((ind + 100000) % 3);
   V3F RGB((k == 0) * 255.0, (k == 1) * 255.0, (k == 2) * 255.0);
   // cout<<"RGB: "<<RGB.transpose()<<endl;
@@ -625,13 +785,7 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   for (uint i = 0; i < plsize; i++)
   {
     const pointWithVar p_v = input_points[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = p_v.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    const VOXEL_LOCATION position = worldToVoxelLocation(p_v.point_w, voxel_size);
     auto iter = voxel_map_.find(position);
     if (iter != voxel_map_.end()) { voxel_map_[position]->UpdateOctoTree(p_v); }
     else
@@ -648,11 +802,169 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   }
 }
 
+void VoxelMapManager::UpdateKnnPointMap(const PointCloudXYZI::Ptr &world_cloud)
+{
+  if (config_setting_.correspondence_mode_ != "fastlio_knn" || world_cloud == nullptr || world_cloud->empty()) return;
+
+  const double voxel_size = config_setting_.knn_map_voxel_size_;
+  for (const auto &point : world_cloud->points)
+  {
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
+
+    const V3D position(point.x, point.y, point.z);
+    const VOXEL_LOCATION voxel = worldToVoxelLocation(position, voxel_size);
+    const V3D center((static_cast<double>(voxel.x) + 0.5) * voxel_size,
+                     (static_cast<double>(voxel.y) + 0.5) * voxel_size,
+                     (static_cast<double>(voxel.z) + 0.5) * voxel_size);
+    const double candidate_distance = (position - center).squaredNorm();
+
+    const auto existing = knn_map_voxels_.find(voxel);
+    if (existing == knn_map_voxels_.end())
+    {
+      knn_map_voxels_.emplace(voxel, point);
+      continue;
+    }
+
+    const V3D existing_position(existing->second.x, existing->second.y, existing->second.z);
+    if (candidate_distance < (existing_position - center).squaredNorm())
+    {
+      existing->second = point;
+    }
+  }
+
+  rebuildKnnIndex();
+}
+
+void VoxelMapManager::rebuildKnnIndex()
+{
+  knn_map_cloud_->clear();
+  knn_map_cloud_->reserve(knn_map_voxels_.size());
+  for (const auto &entry : knn_map_voxels_)
+  {
+    knn_map_cloud_->push_back(entry.second);
+  }
+
+  if (std::getenv("FAST_LIVO2_DETERMINISTIC") != nullptr)
+  {
+    std::sort(knn_map_cloud_->points.begin(), knn_map_cloud_->points.end(), [](const PointType &lhs, const PointType &rhs) {
+      if (lhs.x != rhs.x) return lhs.x < rhs.x;
+      if (lhs.y != rhs.y) return lhs.y < rhs.y;
+      return lhs.z < rhs.z;
+    });
+  }
+
+  knn_map_cloud_->width = static_cast<uint32_t>(knn_map_cloud_->size());
+  knn_map_cloud_->height = 1;
+  knn_map_cloud_->is_dense = true;
+  knn_kdtree_->setInputCloud(knn_map_cloud_);
+}
+
+bool VoxelMapManager::estimateKnnPlane(const std::vector<int> &point_indices, V3D &normal, double &d, V3D &center) const
+{
+  const int point_count = static_cast<int>(point_indices.size());
+  if (point_count != config_setting_.knn_num_match_points_) return false;
+
+  Eigen::MatrixXd coordinates(point_count, 3);
+  center.setZero();
+  for (int i = 0; i < point_count; ++i)
+  {
+    const PointType &point = knn_map_cloud_->points[point_indices[i]];
+    coordinates.row(i) << point.x, point.y, point.z;
+    center += V3D(point.x, point.y, point.z);
+  }
+  center /= static_cast<double>(point_count);
+
+  const Eigen::VectorXd rhs = Eigen::VectorXd::Constant(point_count, -1.0);
+  const V3D unnormalized_normal = coordinates.colPivHouseholderQr().solve(rhs);
+  const double normal_norm = unnormalized_normal.norm();
+  if (!std::isfinite(normal_norm) || normal_norm < 1e-9) return false;
+
+  normal = unnormalized_normal / normal_norm;
+  d = 1.0 / normal_norm;
+  for (int i = 0; i < point_count; ++i)
+  {
+    if (std::abs(normal.dot(coordinates.row(i).transpose()) + d) > config_setting_.knn_plane_threshold_)
+    {
+      return false;
+    }
+  }
+  return true;
+}
+
+void VoxelMapManager::BuildResidualListKNN(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list,
+                                           const bool recompute_neighbors)
+{
+  ptpl_list.clear();
+  if (knn_map_cloud_->size() < static_cast<size_t>(config_setting_.knn_num_match_points_)) return;
+
+  std::vector<PointToPlane> candidates(pv_list.size());
+  std::vector<uint8_t> useful(pv_list.size(), 0);
+
+  #ifdef MP_EN
+    omp_set_num_threads(std::getenv("FAST_LIVO2_DETERMINISTIC") != nullptr ? 1 : MP_PROC_NUM);
+    #pragma omp parallel for
+  #endif
+  for (int i = 0; i < static_cast<int>(pv_list.size()); ++i)
+  {
+    pointWithVar &pv = pv_list[i];
+    PointType query;
+    query.x = static_cast<float>(pv.point_w.x());
+    query.y = static_cast<float>(pv.point_w.y());
+    query.z = static_cast<float>(pv.point_w.z());
+
+    if (recompute_neighbors)
+    {
+      std::vector<int> point_indices(config_setting_.knn_num_match_points_);
+      std::vector<float> squared_distances(config_setting_.knn_num_match_points_);
+      const int found =
+          knn_kdtree_->nearestKSearch(query, config_setting_.knn_num_match_points_, point_indices, squared_distances);
+      knn_nearest_indices_[i] = std::move(point_indices);
+      knn_neighbor_valid_[i] =
+          found == config_setting_.knn_num_match_points_ &&
+          squared_distances.back() <= config_setting_.knn_max_neighbor_sq_dist_;
+    }
+    if (knn_neighbor_valid_[i] == 0) continue;
+
+    const std::vector<int> &point_indices = knn_nearest_indices_[i];
+
+    V3D normal;
+    V3D center;
+    double d = 0.0;
+    if (!estimateKnnPlane(point_indices, normal, d, center)) continue;
+
+    const double signed_distance = normal.dot(pv.point_w) + d;
+    const double body_range = pv.point_b.norm();
+    if (body_range <= 1e-9) continue;
+    const double score = 1.0 - 0.9 * std::abs(signed_distance) / std::sqrt(body_range);
+    if (score <= config_setting_.knn_residual_score_threshold_) continue;
+
+    PointToPlane &match = candidates[i];
+    match.point_b_ = pv.point_b;
+    match.point_w_ = pv.point_w;
+    match.normal_ = normal;
+    match.center_ = center;
+    match.plane_var_.setZero();
+    match.body_cov_ = pv.body_var;
+    match.layer_ = 0;
+    match.d_ = d;
+    match.eigen_value_ = 0.0;
+    match.is_valid_ = true;
+    match.dis_to_plane_ = static_cast<float>(signed_distance);
+    pv.normal = normal;
+    useful[i] = 1;
+  }
+
+  ptpl_list.reserve(pv_list.size());
+  for (size_t i = 0; i < useful.size(); ++i)
+  {
+    if (useful[i] != 0) ptpl_list.push_back(candidates[i]);
+  }
+}
+
 void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
 {
-  int max_layer = config_setting_.max_layer_;
   double voxel_size = config_setting_.max_voxel_size_;
-  double sigma_num = config_setting_.sigma_num_;
+  const int neighbor_radius = config_setting_.neighbor_voxel_radius_;
   std::mutex mylock;
   ptpl_list.clear();
   std::vector<PointToPlane> all_ptpl_list(pv_list.size());
@@ -670,46 +982,42 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   for (int i = 0; i < index.size(); i++)
   {
     pointWithVar &pv = pv_list[i];
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
+    const VOXEL_LOCATION position = worldToVoxelLocation(pv.point_w, voxel_size);
+    PointToPlane single_ptpl;
+    bool is_sucess = false;
+    double prob = 0;
+
+    // Search the current voxel and every voxel in the configured neighborhood.
+    // This keeps data association continuous across voxel boundaries and also
+    // allows recovery when the IMU prediction lands in an empty voxel.
+    for (int dx = -neighbor_radius; dx <= neighbor_radius; ++dx)
     {
-      loc_xyz[j] = pv.point_w[j] / voxel_size;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
+      for (int dy = -neighbor_radius; dy <= neighbor_radius; ++dy)
+      {
+        for (int dz = -neighbor_radius; dz <= neighbor_radius; ++dz)
+        {
+          const VOXEL_LOCATION candidate(position.x + dx, position.y + dy, position.z + dz);
+          const auto iter = voxel_map_.find(candidate);
+          if (iter != voxel_map_.end())
+          {
+            build_single_residual(pv, iter->second, 0, is_sucess, prob, single_ptpl);
+          }
+        }
+      }
     }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
-    auto iter = voxel_map_.find(position);
-    if (iter != voxel_map_.end())
+
+    if (is_sucess)
     {
-      VoxelOctoTree *current_octo = iter->second;
-      PointToPlane single_ptpl;
-      bool is_sucess = false;
-      double prob = 0;
-      build_single_residual(pv, current_octo, 0, is_sucess, prob, single_ptpl);
-      if (!is_sucess)
-      {
-        VOXEL_LOCATION near_position = position;
-        if (loc_xyz[0] > (current_octo->voxel_center_[0] + current_octo->quater_length_)) { near_position.x = near_position.x + 1; }
-        else if (loc_xyz[0] < (current_octo->voxel_center_[0] - current_octo->quater_length_)) { near_position.x = near_position.x - 1; }
-        if (loc_xyz[1] > (current_octo->voxel_center_[1] + current_octo->quater_length_)) { near_position.y = near_position.y + 1; }
-        else if (loc_xyz[1] < (current_octo->voxel_center_[1] - current_octo->quater_length_)) { near_position.y = near_position.y - 1; }
-        if (loc_xyz[2] > (current_octo->voxel_center_[2] + current_octo->quater_length_)) { near_position.z = near_position.z + 1; }
-        else if (loc_xyz[2] < (current_octo->voxel_center_[2] - current_octo->quater_length_)) { near_position.z = near_position.z - 1; }
-        auto iter_near = voxel_map_.find(near_position);
-        if (iter_near != voxel_map_.end()) { build_single_residual(pv, iter_near->second, 0, is_sucess, prob, single_ptpl); }
-      }
-      if (is_sucess)
-      {
-        mylock.lock();
-        useful_ptpl[i] = true;
-        all_ptpl_list[i] = single_ptpl;
-        mylock.unlock();
-      }
-      else
-      {
-        mylock.lock();
-        useful_ptpl[i] = false;
-        mylock.unlock();
-      }
+      mylock.lock();
+      useful_ptpl[i] = true;
+      all_ptpl_list[i] = single_ptpl;
+      mylock.unlock();
+    }
+    else
+    {
+      mylock.lock();
+      useful_ptpl[i] = false;
+      mylock.unlock();
     }
   }
   for (size_t i = 0; i < useful_ptpl.size(); i++)
@@ -940,16 +1248,10 @@ void VoxelMapManager::mapSliding()
   //get global id now
   last_slide_position = position_last_;
   double t_sliding_start = omp_get_wtime();
-  float loc_xyz[3];
-  for (int j = 0; j < 3; j++)
-  {
-    loc_xyz[j] = position_last_[j] / config_setting_.max_voxel_size_;
-    if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-  }
-  // VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);//discrete global
-  clearMemOutOfMap((int64_t)loc_xyz[0] + config_setting_.half_map_size, (int64_t)loc_xyz[0] - config_setting_.half_map_size,
-                    (int64_t)loc_xyz[1] + config_setting_.half_map_size, (int64_t)loc_xyz[1] - config_setting_.half_map_size,
-                    (int64_t)loc_xyz[2] + config_setting_.half_map_size, (int64_t)loc_xyz[2] - config_setting_.half_map_size);
+  const VOXEL_LOCATION position = worldToVoxelLocation(position_last_, config_setting_.max_voxel_size_);
+  clearMemOutOfMap(position.x + config_setting_.half_map_size, position.x - config_setting_.half_map_size,
+                    position.y + config_setting_.half_map_size, position.y - config_setting_.half_map_size,
+                    position.z + config_setting_.half_map_size, position.z - config_setting_.half_map_size);
   double t_sliding_end = omp_get_wtime();
   std::cout<<RED<<"[DEBUG]: Map sliding using "<<t_sliding_end - t_sliding_start<<" secs"<<RESET<<"\n";
   return;

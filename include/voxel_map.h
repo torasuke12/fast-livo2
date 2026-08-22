@@ -20,7 +20,9 @@ which is included as part of this source code package.
 #include <mutex>
 #include <omp.h>
 #include <pcl/common/io.h>
+#include <pcl/kdtree/kdtree_flann.h>
 #include <rclcpp/rclcpp.hpp>
+#include <string>
 #include <thread>
 #include <unistd.h>
 #include <unordered_map>
@@ -41,6 +43,16 @@ typedef struct VoxelMapConfig
   double beam_err_;
   double dept_err_;
   double sigma_num_;
+  double max_state_cov_for_matching_;
+  int neighbor_voxel_radius_;
+  std::string correspondence_mode_;
+  int knn_num_match_points_;
+  double knn_max_neighbor_sq_dist_;
+  double knn_plane_threshold_;
+  double knn_residual_score_threshold_;
+  double knn_map_voxel_size_;
+  double knn_laser_point_cov_;
+  bool gravity_norm_constraint_;
   bool is_pub_plane_map_;
 
   // config of local map sliding
@@ -214,6 +226,11 @@ public:
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;
   std::vector<PointToPlane> ptpl_list_;
+  std::unordered_map<VOXEL_LOCATION, PointType> knn_map_voxels_;
+  PointCloudXYZI::Ptr knn_map_cloud_;
+  pcl::KdTreeFLANN<PointType>::Ptr knn_kdtree_;
+  std::vector<std::vector<int>> knn_nearest_indices_;
+  std::vector<uint8_t> knn_neighbor_valid_;
 
   VoxelMapManager(VoxelMapConfig &config_setting, std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &voxel_map)
       : config_setting_(config_setting), voxel_map_(voxel_map)
@@ -222,9 +239,12 @@ public:
     feats_undistort_.reset(new PointCloudXYZI());
     feats_down_body_.reset(new PointCloudXYZI());
     feats_down_world_.reset(new PointCloudXYZI());
+    knn_map_cloud_.reset(new PointCloudXYZI());
+    knn_kdtree_.reset(new pcl::KdTreeFLANN<PointType>());
   };
 
   void StateEstimation(StatesGroup &state_propagat);
+  M3D boundedStateCovarianceBlock(int start_index) const;
   void TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud,
                       pcl::PointCloud<pcl::PointXYZI>::Ptr &trans_cloud);
 
@@ -232,8 +252,11 @@ public:
   V3F RGBFromVoxel(const V3D &input_point);
 
   void UpdateVoxelMap(const std::vector<pointWithVar> &input_points);
+  void UpdateKnnPointMap(const PointCloudXYZI::Ptr &world_cloud);
 
   void BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list);
+  void BuildResidualListKNN(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list,
+                            bool recompute_neighbors);
 
   void build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess, double &prob,
                              PointToPlane &single_ptpl);
@@ -244,6 +267,9 @@ public:
   void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
 
 private:
+  void rebuildKnnIndex();
+  bool estimateKnnPlane(const std::vector<int> &point_indices, V3D &normal, double &d, V3D &center) const;
+  void constrainGravityState(bool project_covariance);
   void GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list);
 
   void pubSinglePlane(visualization_msgs::MarkerArray &plane_pub, const std::string plane_ns, const VoxelPlane &single_plane, const float alpha,
