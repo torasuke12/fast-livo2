@@ -13,6 +13,8 @@ which is included as part of this source code package.
 #ifndef COMMON_LIB_H
 #define COMMON_LIB_H
 
+#include <cmath>
+
 #include <utils/so3_math.h>
 #include <utils/types.h>
 #include <utils/color.h>
@@ -57,6 +59,19 @@ enum EKF_STATE
   LIO = 2,
   LO = 3
 };
+
+inline double maxPointOffsetTimeMs(const PointCloudXYZI &cloud)
+{
+  double max_offset_ms = 0.0;
+  for (const auto &point : cloud.points)
+  {
+    if (std::isfinite(point.curvature) && point.curvature > max_offset_ms)
+    {
+      max_offset_ms = point.curvature;
+    }
+  }
+  return max_offset_ms;
+}
 
 struct MeasureGroup
 {

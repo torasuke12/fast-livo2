@@ -263,33 +263,27 @@ void Preprocess::mid360_pointcloud2_handler(const sensor_msgs::PointCloud2::Cons
   sensor_msgs::PointCloud2ConstIterator<uint8_t> iter_line(*msg, "line");
   sensor_msgs::PointCloud2ConstIterator<double> iter_timestamp(*msg, "timestamp");
 
+  // livox_ros_driver2 publishes an absolute nanosecond timestamp for every
+  // point. FAST-LIVO2 stores the offset from the scan header in milliseconds.
+  constexpr double kNanosecondsToMilliseconds = 1.0e-6;
+  const double header_timestamp_ns = static_cast<double>(msg->header.stamp.sec) * 1.0e9 +
+                                     static_cast<double>(msg->header.stamp.nanosec);
+
   uint valid_num = 0;
-  bool has_last_curvature = false;
-  double last_curvature = 0.0;
   for (int i = 0; i < plsize;
        ++i, ++iter_x, ++iter_y, ++iter_z, ++iter_intensity, ++iter_line, ++iter_timestamp)
   {
     if (*iter_line >= N_SCANS) continue;
+
+    const double point_offset_ms = (*iter_timestamp - header_timestamp_ns) * kNanosecondsToMilliseconds;
+    if (!std::isfinite(point_offset_ms)) continue;
 
     valid_num++;
     pl_full[i].x = *iter_x;
     pl_full[i].y = *iter_y;
     pl_full[i].z = *iter_z;
     pl_full[i].intensity = *iter_intensity;
-    pl_full[i].curvature = *iter_timestamp / 1000000.0;
-
-    if (!has_last_curvature)
-    {
-      pl_full[i].curvature = fabs(pl_full[i].curvature) < 1.0 ? pl_full[i].curvature : 0.0;
-      has_last_curvature = true;
-    }
-    else
-    {
-      pl_full[i].curvature = fabs(pl_full[i].curvature - last_curvature) < 1.0
-                                 ? pl_full[i].curvature
-                                 : last_curvature + 0.004166667f;
-    }
-    last_curvature = pl_full[i].curvature;
+    pl_full[i].curvature = point_offset_ms;
 
     if (valid_num % point_filter_num != 0) continue;
     const double range = pl_full[i].x * pl_full[i].x + pl_full[i].y * pl_full[i].y + pl_full[i].z * pl_full[i].z;
@@ -298,6 +292,13 @@ void Preprocess::mid360_pointcloud2_handler(const sensor_msgs::PointCloud2::Cons
 
     pl_surf.push_back(pl_full[i]);
   }
+
+  // MID360 packets can contain small timestamp inversions. All downstream
+  // deskew operations assume ascending point time.
+  std::stable_sort(pl_surf.points.begin(), pl_surf.points.end(),
+                   [](const PointType &lhs, const PointType &rhs) {
+                     return lhs.curvature < rhs.curvature;
+                   });
 }
 
 void Preprocess::oust64_handler(const sensor_msgs::PointCloud2::ConstSharedPtr &msg)
