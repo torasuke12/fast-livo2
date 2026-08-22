@@ -50,7 +50,10 @@ laserMapping:
 
     preprocess:
       hilti_en: false
-      point_filter_num: 3
+      # FAST-LIO's PointCloud2 path passes every input point to the 0.5 m
+      # VoxelGrid; pre-decimating to one point in three removed useful corridor
+      # structure and caused the post-U-turn longitudinal solution to flip.
+      point_filter_num: 1
       filter_size_surf: 0.5
       lidar_type: 8
       scan_line: 4
@@ -73,18 +76,54 @@ laserMapping:
 
     imu:
       imu_en: true
-      imu_int_frame: 30
+      # FAST-LIO uses MAX_INI_COUNT=10. IMUs are buffered before the first
+      # LiDAR callback, so this window is selected by sensor time, not callback order.
+      imu_int_frame: 10
       acc_cov: 0.1
       gyr_cov: 0.1
       gravity_est_en: true
       ba_bg_est_en: true
+      # Accept gyro bias only after a stationary IMU window is observed.
+      stationary_gyr_mean_threshold: 0.1       # rad/s
+      stationary_gyr_std_threshold: 0.02       # rad/s, maximum axis stddev
+      stationary_acc_std_ratio_threshold: 0.05 # norm(stddev) / norm(mean)
+      # Match FAST-LIO's initial state covariance. Its IKFoM state starts with
+      # unit covariance for rotation, position, and velocity.
+      initial_rotation_cov: 1.0
+      initial_position_cov: 1.0
+      initial_velocity_cov: 1.0
+      initial_gyro_bias_cov: 0.0001
+      initial_accel_bias_cov: 0.001
 
     lio:
-      max_iterations: 5
+      # FAST-LIO MID360 uses 3 (IKFoM evaluates once before iteration 0 as well).
+      max_iterations: 3
       dept_err: 0.02
       beam_err: 0.05
       min_eigen_value: 0.0001
-      voxel_size: 0.4
+      # Match FAST-LIO filter_size_map for a fair 0.5 m comparison.
+      voxel_size: 0.5
+      # Radius 1 searches the current voxel plus all 26 adjacent voxels.
+      neighbor_voxel_radius: 1
+      # FAST-LIO-compatible LIO association: 5 nearest map points, local plane
+      # fitting, and residual score filtering. The voxel plane map remains in
+      # use by VIO and for visualization.
+      correspondence_mode: fastlio_knn
+      knn_num_match_points: 5
+      knn_max_neighbor_sq_dist: 5.0
+      knn_plane_threshold: 0.1
+      knn_residual_score_threshold: 0.9
+      knn_map_voxel_size: 0.5
+      # The PCL-KD compatibility map retains fewer independent representatives
+      # than FAST-LIO's incremental ikd-tree. 0.0003 restores comparable total
+      # LiDAR information and prevents corridor-axis velocity/bias drift.
+      knn_laser_point_cov: 0.0003
+      # FAST-LIO models gravity on S2: direction is estimated while magnitude
+      # remains fixed at 9.81 m/s^2.
+      gravity_norm_constraint: true
+      # Do not let a growing filter covariance make point-to-plane gating and
+      # map-plane uncertainty unbounded. The filter covariance itself is not capped.
+      max_state_cov_for_matching: 0.01
       max_layer: 2
       max_points_num: 100
       layer_init_num: [5, 5, 5, 5, 5]
@@ -100,6 +139,9 @@ laserMapping:
 
     publish:
       dense_map_en: true
+      map_en: true
+      map_publish_interval: 10
+      map_voxel_size: 0.5
       pub_effect_point_en: false
       pub_plane_en: false
       pub_scan_num: 1

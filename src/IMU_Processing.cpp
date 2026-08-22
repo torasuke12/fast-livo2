@@ -12,6 +12,8 @@ which is included as part of this source code package.
 
 #include "IMU_Processing.h"
 
+#include <limits>
+
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
                            Zero3d(0, 0, 0), b_first_frame(true), imu_need_init(true)
 {
@@ -21,14 +23,14 @@ ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
   cov_bias_gyr = V3D(0.1, 0.1, 0.1);
   cov_bias_acc = V3D(0.1, 0.1, 0.1);
   cov_inv_expo = 0.2;
-  mean_acc = V3D(0, 0, -1.0);
-  mean_gyr = V3D(0, 0, 0);
+  reset_imu_init_statistics();
   angvel_last = Zero3d;
   acc_s_last = Zero3d;
   Lid_offset_to_IMU = Zero3d;
   Lid_rot_to_IMU = Eye3d;
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+  last_prop_end_time = 0.0;
 }
 
 ImuProcess::~ImuProcess() {}
@@ -36,14 +38,13 @@ ImuProcess::~ImuProcess() {}
 void ImuProcess::Reset()
 {
   ROS_WARN("Reset ImuProcess");
-  mean_acc = V3D(0, 0, -1.0);
-  mean_gyr = V3D(0, 0, 0);
+  reset_imu_init_statistics();
   angvel_last = Zero3d;
   imu_need_init = true;
-  init_iter_num = 1;
   IMUpose.clear();
   last_imu.reset(new sensor_msgs::Imu());
   cur_pcl_un_.reset(new PointCloudXYZI());
+  last_prop_end_time = 0.0;
 }
 
 void ImuProcess::disable_imu()
@@ -99,7 +100,45 @@ void ImuProcess::set_inv_expo_cov(const double &inv_expo) { cov_inv_expo = inv_e
 
 void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
 
-void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num; }
+void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num > 1 ? num : 2; }
+
+void ImuProcess::set_imu_stationary_thresholds(const double &gyr_mean_threshold,
+                                               const double &gyr_std_threshold,
+                                               const double &acc_std_ratio_threshold)
+{
+  stationary_gyr_mean_threshold = gyr_mean_threshold;
+  stationary_gyr_std_threshold = gyr_std_threshold;
+  stationary_acc_std_ratio_threshold = acc_std_ratio_threshold;
+}
+
+void ImuProcess::reset_imu_init_statistics()
+{
+  init_iter_num = 0;
+  mean_acc.setZero();
+  mean_gyr.setZero();
+  acc_m2.setZero();
+  gyr_m2.setZero();
+}
+
+bool ImuProcess::imu_init_is_stationary(double &gyr_std_max, double &acc_std_ratio) const
+{
+  if (init_iter_num < 2 || mean_acc.norm() < 1.0e-6)
+  {
+    gyr_std_max = std::numeric_limits<double>::infinity();
+    acc_std_ratio = std::numeric_limits<double>::infinity();
+    return false;
+  }
+
+  const double variance_denominator = static_cast<double>(init_iter_num - 1);
+  const V3D gyr_std = (gyr_m2 / variance_denominator).cwiseMax(0.0).cwiseSqrt();
+  const V3D acc_std = (acc_m2 / variance_denominator).cwiseMax(0.0).cwiseSqrt();
+  gyr_std_max = gyr_std.maxCoeff();
+  acc_std_ratio = acc_std.norm() / mean_acc.norm();
+
+  return mean_gyr.norm() <= stationary_gyr_mean_threshold &&
+         gyr_std_max <= stationary_gyr_std_threshold &&
+         acc_std_ratio <= stationary_acc_std_ratio_threshold;
+}
 
 void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, int &N)
 {
@@ -111,12 +150,7 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
   if (b_first_frame)
   {
     Reset();
-    N = 1;
     b_first_frame = false;
-    const auto &imu_acc = meas.imu.front()->linear_acceleration;
-    const auto &gyr_acc = meas.imu.front()->angular_velocity;
-    mean_acc << imu_acc.x, imu_acc.y, imu_acc.z;
-    mean_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
     // first_lidar_time = meas.lidar_frame_beg_time;
     // cout<<"init acc norm: "<<mean_acc.norm()<<endl;
   }
@@ -128,8 +162,13 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
     cur_gyr << gyr_acc.x, gyr_acc.y, gyr_acc.z;
 
-    mean_acc += (cur_acc - mean_acc) / N;
-    mean_gyr += (cur_gyr - mean_gyr) / N;
+    ++N;
+    const V3D acc_delta = cur_acc - mean_acc;
+    const V3D gyr_delta = cur_gyr - mean_gyr;
+    mean_acc += acc_delta / N;
+    mean_gyr += gyr_delta / N;
+    acc_m2 += acc_delta.cwiseProduct(cur_acc - mean_acc);
+    gyr_m2 += gyr_delta.cwiseProduct(cur_gyr - mean_gyr);
 
     // cov_acc = cov_acc * (N - 1.0) / N + (cur_acc -
     // mean_acc).cwiseProduct(cur_acc - mean_acc) * (N - 1.0) / (N * N); cov_gyr
@@ -137,13 +176,10 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
     // mean_gyr) * (N - 1.0) / (N * N);
 
     // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
-
-    N++;
   }
   IMU_mean_acc_norm = mean_acc.norm();
   state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
-  state_inout.bias_g = Zero3d; // mean_gyr;
 
   last_imu = meas.imu.back();
 }
@@ -154,9 +190,9 @@ void ImuProcess::Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state
   /*** sort point clouds by offset time ***/
   const double &pcl_beg_time = meas.lidar_frame_beg_time;
   sort(pcl_out.points.begin(), pcl_out.points.end(), time_list);
-  const double &pcl_end_time = pcl_beg_time + pcl_out.points.back().curvature / double(1000);
+  const double pcl_end_offset_time = maxPointOffsetTimeMs(pcl_out) / double(1000);
+  const double pcl_end_time = pcl_beg_time + pcl_end_offset_time;
   meas.last_lio_update_time = pcl_end_time;
-  const double &pcl_end_offset_time = pcl_out.points.back().curvature / double(1000);
 
   MD(DIM_STATE, DIM_STATE) F_x, cov_w;
   double dt = 0;
@@ -358,17 +394,10 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
         dt = fast_livo2::stampToSec(tail->header.stamp) - last_prop_end_time;
         offs_t = fast_livo2::stampToSec(tail->header.stamp) - prop_beg_time;
       }
-      else if (i != v_imu.size() - 2)
-      {
-        // printf("11 \n");
-        dt = fast_livo2::stampToSec(tail->header.stamp) - fast_livo2::stampToSec(head->header.stamp);
-        offs_t = fast_livo2::stampToSec(tail->header.stamp) - prop_beg_time;
-      }
       else
       {
-        // printf("22 \n");
-        dt = prop_end_time - fast_livo2::stampToSec(head->header.stamp);
-        offs_t = prop_end_time - prop_beg_time;
+        dt = fast_livo2::stampToSec(tail->header.stamp) - fast_livo2::stampToSec(head->header.stamp);
+        offs_t = fast_livo2::stampToSec(tail->header.stamp) - prop_beg_time;
       }
 
       dt_all += dt;
@@ -428,6 +457,40 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       // "<<fast_livo2::stampToSec(tail->header.stamp)<<endl; printf("[ LIO Propagation ]
       // offs_t: %lf \n", offs_t);
       IMUpose.push_back(set_pose6d(offs_t, acc_imu, angvel_avr, vel_imu, pos_imu, R_imu));
+    }
+
+    // FAST-LIO propagates from the final IMU timestamp to the scan end as a
+    // separate interval. Combining it with the preceding IMU interval makes
+    // the dt^2 process-noise term too large on every scan.
+    dt = prop_end_time - imu_end_time;
+    if (dt > 1e-9)
+    {
+      M3D acc_avr_skew;
+      acc_avr_skew << SKEW_SYM_MATRX(acc_avr);
+
+      F_x.setIdentity();
+      cov_w.setZero();
+      F_x.block<3, 3>(0, 0) = Exp(angvel_avr, -dt);
+      if (ba_bg_est_en) F_x.block<3, 3>(0, 10) = -Eye3d * dt;
+      F_x.block<3, 3>(3, 7) = Eye3d * dt;
+      F_x.block<3, 3>(7, 0) = -R_imu * acc_avr_skew * dt;
+      if (ba_bg_est_en) F_x.block<3, 3>(7, 13) = -R_imu * dt;
+      if (gravity_est_en) F_x.block<3, 3>(7, 16) = Eye3d * dt;
+
+      if (exposure_estimate_en) cov_w(6, 6) = cov_inv_expo * dt * dt;
+      cov_w.block<3, 3>(0, 0).diagonal() = cov_gyr * dt * dt;
+      cov_w.block<3, 3>(7, 7) = R_imu * cov_acc.asDiagonal() * R_imu.transpose() * dt * dt;
+      cov_w.block<3, 3>(10, 10).diagonal() = cov_bias_gyr * dt * dt;
+      cov_w.block<3, 3>(13, 13).diagonal() = cov_bias_acc * dt * dt;
+      state_inout.cov = F_x * state_inout.cov * F_x.transpose() + cov_w;
+
+      const M3D Exp_f = Exp(angvel_avr, dt);
+      R_imu = R_imu * Exp_f;
+      acc_imu = R_imu * acc_avr + state_inout.gravity;
+      pos_imu = pos_imu + vel_imu * dt + 0.5 * acc_imu * dt * dt;
+      vel_imu = vel_imu + acc_imu * dt;
+      angvel_last = angvel_avr;
+      acc_s_last = acc_imu;
     }
 
     // unbiased_gyr = V3D(IMUpose.back().gyr[0], IMUpose.back().gyr[1], IMUpose.back().gyr[2]);
@@ -501,11 +564,13 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
       auto head = it_kp - 1;
       auto tail = it_kp;
       R_imu << MAT_FROM_ARRAY(head->rot);
-      acc_imu << VEC_FROM_ARRAY(head->acc);
-      // cout<<"head imu acc: "<<acc_imu.transpose()<<endl;
       vel_imu << VEC_FROM_ARRAY(head->vel);
       pos_imu << VEC_FROM_ARRAY(head->pos);
-      angvel_avr << VEC_FROM_ARRAY(head->gyr);
+      // Match FAST-LIO's deskew convention: the IMU values stored at tail
+      // describe the [head, tail] integration interval. Using head introduces
+      // a one-sample lag that is most visible during a fast U-turn.
+      acc_imu << VEC_FROM_ARRAY(tail->acc);
+      angvel_avr << VEC_FROM_ARRAY(tail->gyr);
 
       // printf("head->offset_time: %lf \n", head->offset_time);
       // printf("it_pcl->curvature: %lf pt dt: %lf \n", it_pcl->curvature,
@@ -566,10 +631,26 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
 
     last_imu = meas.imu.back();
 
-    if (init_iter_num > MAX_INI_COUNT)
+    if (init_iter_num >= MAX_INI_COUNT)
     {
+      double gyr_std_max = 0.0;
+      double acc_std_ratio = 0.0;
+      if (!imu_init_is_stationary(gyr_std_max, acc_std_ratio))
+      {
+        ROS_WARN("IMU is not stationary; restarting initialization. gyro mean norm: %.6f rad/s, "
+                 "gyro max std: %.6f rad/s, accel std ratio: %.6f",
+                 mean_gyr.norm(), gyr_std_max, acc_std_ratio);
+        reset_imu_init_statistics();
+        return;
+      }
+
+      stat.bias_g = mean_gyr;
       // cov_acc *= pow(G_m_s2 / mean_acc.norm(), 2);
       imu_need_init = false;
+      // The first propagation starts at the end of the scan used for IMU
+      // initialization. Leaving this value uninitialized made its result
+      // depend on heap contents and could integrate an invalid time interval.
+      last_prop_end_time = pcl_end_time;
       ROS_INFO("IMU Initials: Gravity: %.4f %.4f %.4f %.4f; acc covarience: "
                "%.8f %.8f %.8f; gry covarience: %.8f %.8f %.8f \n",
                stat.gravity[0], stat.gravity[1], stat.gravity[2], mean_acc.norm(), cov_acc[0], cov_acc[1], cov_acc[2], cov_gyr[0], cov_gyr[1],
@@ -577,6 +658,8 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
       ROS_INFO("IMU Initials: ba covarience: %.8f %.8f %.8f; bg covarience: "
                "%.8f %.8f %.8f",
                cov_bias_acc[0], cov_bias_acc[1], cov_bias_acc[2], cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2]);
+      ROS_INFO("IMU stationary initialization accepted: gyro bias %.8f %.8f %.8f",
+               stat.bias_g[0], stat.bias_g[1], stat.bias_g[2]);
       fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
     }
 

@@ -51,6 +51,7 @@ public:
   void img_cbk(const sensor_msgs::Image::ConstSharedPtr &msg_in);
   void publish_img_rgb(const fast_livo2::Publisher &pubImage, VIOManagerPtr vio_manager);
   void publish_frame_world(const fast_livo2::Publisher &pubLaserCloudFullRes, VIOManagerPtr vio_manager);
+  void update_and_publish_map(const PointCloudXYZI::Ptr &world_cloud);
   void publish_visual_sub_map(const fast_livo2::Publisher &pubSubVisualMap);
   void publish_effect_world(const fast_livo2::Publisher &pubLaserCloudEffect, const std::vector<PointToPlane> &ptpl_list);
   void publish_odometry(const fast_livo2::Publisher &pubOdomAftMapped);
@@ -80,6 +81,14 @@ public:
 
   double res_mean_last = 0.05;
   double gyr_cov = 0, acc_cov = 0, inv_expo_cov = 0;
+  double stationary_gyr_mean_threshold = 0.1;
+  double stationary_gyr_std_threshold = 0.02;
+  double stationary_acc_std_ratio_threshold = 0.05;
+  double initial_rotation_cov = 1.0;
+  double initial_position_cov = 1.0;
+  double initial_velocity_cov = 1.0;
+  double initial_gyro_bias_cov = 0.0001;
+  double initial_accel_bias_cov = 0.001;
   double blind_rgb_points = 0.0;
   double last_timestamp_lidar = -1.0, last_timestamp_imu = -1.0, last_timestamp_img = -1.0;
   double filter_size_surf_min = 0;
@@ -88,9 +97,13 @@ public:
   double match_time = 0, solve_time = 0, solve_const_H_time = 0;
 
   bool lidar_map_inited = false, pcd_save_en = false, img_save_en = false, pub_effect_point_en = false, pose_output_en = false, ros_driver_fix_en = false, hilti_en = false;
+  bool map_pub_en = false;
   bool reliable_sensor_qos = false;
   int img_save_interval = 1, pcd_save_interval = -1, pcd_save_type = 0;
   int pub_scan_num = 1;
+  int map_pub_interval = 10;
+  int map_pub_frame_count = 0;
+  double map_pub_voxel_size = 0.5;
 
   StatesGroup imu_propagate, latest_ekf_state;
 
@@ -142,6 +155,7 @@ public:
   PointCloudXYZI::Ptr pcl_wait_pub;
   PointCloudXYZRGB::Ptr pcl_wait_save;
   PointCloudXYZI::Ptr pcl_wait_save_intensity;
+  std::unordered_map<VOXEL_LOCATION, PointType> laser_map_voxels;
 
   ofstream fout_pre, fout_out, fout_visual_pos, fout_lidar_pos, fout_points;
 

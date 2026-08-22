@@ -40,6 +40,9 @@ public:
   void set_acc_bias_cov(const V3D &b_a);
   void set_inv_expo_cov(const double &inv_expo);
   void set_imu_init_frame_num(const int &num);
+  void set_imu_stationary_thresholds(const double &gyr_mean_threshold,
+                                     const double &gyr_std_threshold,
+                                     const double &acc_std_ratio_threshold);
   void disable_imu();
   void disable_gravity_est();
   void disable_bias_est();
@@ -65,6 +68,8 @@ public:
 
 private:
   void IMU_init(const MeasureGroup &meas, StatesGroup &state, int &N);
+  void reset_imu_init_statistics();
+  bool imu_init_is_stationary(double &gyr_std_max, double &acc_std_ratio) const;
   void Forward_without_imu(LidarMeasureGroup &meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out);
   PointCloudXYZI pcl_wait_proc;
   sensor_msgs::Imu::ConstSharedPtr last_imu;
@@ -74,11 +79,16 @@ private:
   V3D Lid_offset_to_IMU;
   V3D mean_acc;
   V3D mean_gyr;
+  V3D acc_m2;
+  V3D gyr_m2;
   V3D angvel_last;
   V3D acc_s_last;
   double last_prop_end_time;
   double time_last_scan;
-  int init_iter_num = 1, MAX_INI_COUNT = 20;
+  double stationary_gyr_mean_threshold = 0.1;
+  double stationary_gyr_std_threshold = 0.02;
+  double stationary_acc_std_ratio_threshold = 0.05;
+  int init_iter_num = 0, MAX_INI_COUNT = 20;
   bool b_first_frame = true;
   bool imu_en = true;
   bool gravity_est_en = true;
