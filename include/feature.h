@@ -26,6 +26,7 @@ struct Feature
     EDGELET
   };
   int id_;
+  uint64_t temporal_anchor_ = UINT64_MAX;
   FeatureType type_;     //!< Type can be corner or edgelet.
   cv::Mat img_;          //!< Image associated with the patch feature
   Vector2d px_;          //!< Coordinates in pixels on pyramid level 0.

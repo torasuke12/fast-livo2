@@ -11,7 +11,9 @@ which is included as part of this source code package.
 */
 
 #include "IMU_Processing.h"
+#include <filesystem>
 
+#include <algorithm>
 #include <limits>
 
 ImuProcess::ImuProcess() : Eye3d(M3D::Identity()),
@@ -102,6 +104,11 @@ void ImuProcess::set_acc_bias_cov(const V3D &b_a) { cov_bias_acc = b_a; }
 
 void ImuProcess::set_imu_init_frame_num(const int &num) { MAX_INI_COUNT = num > 1 ? num : 2; }
 
+void ImuProcess::set_imu_init_duration(const double &duration_sec)
+{
+  imu_init_duration_sec = std::isfinite(duration_sec) && duration_sec > 0.0 ? duration_sec : 0.0;
+}
+
 void ImuProcess::set_imu_stationary_thresholds(const double &gyr_mean_threshold,
                                                const double &gyr_std_threshold,
                                                const double &acc_std_ratio_threshold)
@@ -118,6 +125,8 @@ void ImuProcess::reset_imu_init_statistics()
   mean_gyr.setZero();
   acc_m2.setZero();
   gyr_m2.setZero();
+  imu_init_start_time = -1.0;
+  imu_init_end_time = -1.0;
 }
 
 bool ImuProcess::imu_init_is_stationary(double &gyr_std_max, double &acc_std_ratio) const
@@ -144,7 +153,6 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
 {
   /** 1. initializing the gravity, gyro bias, acc and gyro covariance
    ** 2. normalize the acceleration measurenments to unit gravity **/
-  ROS_INFO("IMU Initializing: %.1f %%", double(N) / MAX_INI_COUNT * 100);
   V3D cur_acc, cur_gyr;
 
   if (b_first_frame)
@@ -157,6 +165,10 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
 
   for (const auto &imu : meas.imu)
   {
+    const double imu_time = fast_livo2::stampToSec(imu->header.stamp);
+    if (imu_init_start_time < 0.0) imu_init_start_time = imu_time;
+    imu_init_end_time = imu_time;
+
     const auto &imu_acc = imu->linear_acceleration;
     const auto &gyr_acc = imu->angular_velocity;
     cur_acc << imu_acc.x, imu_acc.y, imu_acc.z;
@@ -177,6 +189,17 @@ void ImuProcess::IMU_init(const MeasureGroup &meas, StatesGroup &state_inout, in
 
     // cout<<"acc norm: "<<cur_acc.norm()<<" "<<mean_acc.norm()<<endl;
   }
+
+  const double elapsed_time =
+      (imu_init_start_time >= 0.0 && imu_init_end_time >= imu_init_start_time)
+          ? imu_init_end_time - imu_init_start_time
+          : 0.0;
+  const double progress = imu_init_duration_sec > 0.0
+                              ? std::min(1.0, elapsed_time / imu_init_duration_sec)
+                              : std::min(1.0, static_cast<double>(N) / MAX_INI_COUNT);
+  ROS_INFO("IMU Initializing: %.1f %% (%d samples, %.3f / %.3f s)",
+           progress * 100.0, N, elapsed_time, imu_init_duration_sec);
+
   IMU_mean_acc_norm = mean_acc.norm();
   state_inout.gravity = -mean_acc / mean_acc.norm() * G_m_s2;
   state_inout.rot_end = Eye3d; // Exp(mean_acc.cross(V3D(0, 0, -1 / scale_gravity)));
@@ -331,7 +354,15 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
   // IMUpose.clear();
 
   /*** forward propagation at each imu point ***/
-  V3D acc_imu(acc_s_last), angvel_avr(angvel_last), acc_avr, vel_imu(state_inout.vel_end), pos_imu(state_inout.pos_end);
+  // VIO can arrive with no new IMU samples, including immediately after
+  // initialization. Use the most recent measurement for any real forward
+  // extrapolation; acc_avr must also be defined when the interval loop is empty.
+  const auto &held_imu = v_imu.back();
+  V3D acc_avr(held_imu->linear_acceleration.x, held_imu->linear_acceleration.y, held_imu->linear_acceleration.z);
+  acc_avr = acc_avr * G_m_s2 / mean_acc.norm() - state_inout.bias_a;
+  V3D angvel_avr(held_imu->angular_velocity.x, held_imu->angular_velocity.y, held_imu->angular_velocity.z);
+  angvel_avr -= state_inout.bias_g;
+  V3D acc_imu(acc_s_last), vel_imu(state_inout.vel_end), pos_imu(state_inout.pos_end);
   // cout << "[ IMU ] input state: " << state_inout.vel_end.transpose() << " " << state_inout.pos_end.transpose() << endl;
   M3D R_imu(state_inout.rot_end);
   MD(DIM_STATE, DIM_STATE) F_x, cov_w;
@@ -462,7 +493,10 @@ void ImuProcess::UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_
     // FAST-LIO propagates from the final IMU timestamp to the scan end as a
     // separate interval. Combining it with the preceding IMU interval makes
     // the dt^2 process-noise term too large on every scan.
-    dt = prop_end_time - imu_end_time;
+    // LIO and VIO may share a timestamp. The previous call already propagated
+    // to prop_beg_time, even if the last IMU sample preceded that boundary.
+    // Do not integrate that tail twice or change the same-time covariance.
+    dt = prop_end_time - std::max(prop_beg_time, imu_end_time);
     if (dt > 1e-9)
     {
       M3D acc_avr_skew;
@@ -631,7 +665,13 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
 
     last_imu = meas.imu.back();
 
-    if (init_iter_num >= MAX_INI_COUNT)
+    const double init_elapsed_time =
+        (imu_init_start_time >= 0.0 && imu_init_end_time >= imu_init_start_time)
+            ? imu_init_end_time - imu_init_start_time
+            : 0.0;
+    const bool sample_count_ready = init_iter_num >= MAX_INI_COUNT;
+    const bool duration_ready = imu_init_duration_sec <= 0.0 || init_elapsed_time >= imu_init_duration_sec;
+    if (sample_count_ready && duration_ready)
     {
       double gyr_std_max = 0.0;
       double acc_std_ratio = 0.0;
@@ -660,7 +700,9 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
                cov_bias_acc[0], cov_bias_acc[1], cov_bias_acc[2], cov_bias_gyr[0], cov_bias_gyr[1], cov_bias_gyr[2]);
       ROS_INFO("IMU stationary initialization accepted: gyro bias %.8f %.8f %.8f",
                stat.bias_g[0], stat.bias_g[1], stat.bias_g[2]);
-      fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
+      ROS_INFO("IMU initialization window: %.3f s, %d samples",
+               init_elapsed_time, init_iter_num);
+      if (!fout_imu.is_open()) fout_imu.open(DEBUG_FILE_DIR("imu.txt"), ios::out);
     }
 
     return;
@@ -668,4 +710,11 @@ void ImuProcess::Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, Poin
 
   UndistortPcl(lidar_meas, stat, *cur_pcl_un_);
   // cout << "[ IMU ] undistorted point num: " << cur_pcl_un_->size() << endl;
+}
+
+void ImuProcess::set_log_directory(const std::string &directory)
+{
+  std::filesystem::create_directories(directory);
+  fout_imu.open(std::filesystem::path(directory) / "imu.txt", std::ios::out);
+  if (!fout_imu) throw std::runtime_error("Cannot open IMU log in " + directory);
 }

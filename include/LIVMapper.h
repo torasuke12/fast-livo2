@@ -16,6 +16,9 @@ which is included as part of this source code package.
 #include "IMU_Processing.h"
 #include "vio.h"
 #include "preprocess.h"
+#include "temporal_lio.h"
+#include "temporal_trajectory.h"
+#include "temporal_reprojection.h"
 #include <cv_bridge/cv_bridge.h>
 #include <rclcpp/rclcpp.hpp>
 #include <tf2_ros/transform_broadcaster.h>
@@ -35,6 +38,13 @@ public:
   void stateEstimationAndMapping();
   void handleVIO();
   void handleLIO();
+  void handleTemporalLIO();
+  void configureTemporalLIO();
+  void collectTemporalImu();
+  void handleTemporalVIO();
+  void applyTemporalState(const temporal_lio::Report& report);
+  void prepareTemporalVisualPoints();
+  void publishTemporalPath(double time);
   void savePCD();
   void processImu();
   
@@ -73,6 +83,22 @@ public:
   std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> voxel_map;
   
   string root_dir;
+  bool temporal_enabled_ = false;
+  std::string temporal_initialization_mode_ = "single_scan";
+  std::ofstream temporal_initialization_log_;
+  temporal_lio::Config temporal_config_;
+  std::unique_ptr<temporal_lio::Window> temporal_window_;
+  std::vector<temporal_lio::ImuSample> temporal_imu_;
+  std::ofstream temporal_log_, temporal_states_log_;
+  std::ofstream temporal_visual_log_;
+  double temporal_scan_begin_time_ = 0;
+  double temporal_image_interval_sec_ = 0.1;
+  bool temporal_visual_full_points_ = false;
+  bool temporal_visual_joint_reference_ = false;
+  bool temporal_visual_reprojection_ = false;
+  bool temporal_visual_factor_enabled_ = true;
+  std::unique_ptr<temporal_lio::ReprojectionTracker> temporal_reprojection_;
+  temporal_lio::TrajectoryHistory temporal_trajectory_;
   string lid_topic, imu_topic, seq_name, img_topic;
   V3D extT;
   M3D extR;
@@ -81,9 +107,12 @@ public:
 
   double res_mean_last = 0.05;
   double gyr_cov = 0, acc_cov = 0, inv_expo_cov = 0;
+  double gyro_bias_cov = 0.0001, accel_bias_cov = 0.0001;
+  double image_interval_sec = 0.02;
   double stationary_gyr_mean_threshold = 0.1;
   double stationary_gyr_std_threshold = 0.02;
   double stationary_acc_std_ratio_threshold = 0.05;
+  double imu_init_duration_sec = 0.0;
   double initial_rotation_cov = 1.0;
   double initial_position_cov = 1.0;
   double initial_velocity_cov = 1.0;
@@ -133,6 +162,7 @@ public:
   int grid_size, patch_size, grid_n_width, grid_n_height, patch_pyrimid_level;
   double outlier_threshold;
   double plot_time;
+  std::string debug_log_dir;
   int frame_cnt;
   double img_time_offset = 0.0;
   deque<PointCloudXYZI::Ptr> lid_raw_data_buffer;

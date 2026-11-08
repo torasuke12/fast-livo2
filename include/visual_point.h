@@ -24,6 +24,7 @@ class VisualPoint : boost::noncopyable
 {
 public:
   EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+  uint64_t temporal_anchor_ = UINT64_MAX;
 
   Vector3d pos_;                //!< 3d pos of the point in the world coordinate frame.
   Vector3d normal_;             //!< Surface normal at point.

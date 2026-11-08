@@ -11,12 +11,48 @@ which is included as part of this source code package.
 */
 
 #include "vio.h"
+#include "visual_patch_bounds.h"
 
+#include <Eigen/Eigenvalues>
 #include <Eigen/SVD>
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
 #include <cstdlib>
+#include <limits>
+#include <stdexcept>
 
 namespace
 {
+constexpr double kMaxRotationStepRad = 0.7853981633974483; // 45 degrees
+constexpr double kMaxPositionStepM = 2.0;
+constexpr double kMaxVelocityStepMps = 10.0;
+constexpr double kMaxGyroBiasStepRadps = 0.5;
+constexpr double kMaxAccelBiasStepMps2 = 5.0;
+constexpr double kMaxGravityStepMps2 = 2.0;
+constexpr double kMaxInverseExposureStep = 10.0;
+
+VOXEL_LOCATION visualVoxelLocation(const V3D& point)
+{
+  // Insertion, scan retrieval and ray retrieval must use the same half-open
+  // cells on both sides of zero. floor followed by a negative correction
+  // moves every negative coordinate into the adjacent voxel.
+  return VOXEL_LOCATION(static_cast<int64_t>(std::floor(point.x() / 0.5)),
+                        static_cast<int64_t>(std::floor(point.y() / 0.5)),
+                        static_cast<int64_t>(std::floor(point.z() / 0.5)));
+}
+
+bool projectVisiblePoint(const Frame& frame, const V3D& world, int border, V2D& pixel)
+{
+  const V3D camera = frame.w2f(world);
+  if (!camera.allFinite() || camera.z() <= 1e-6) return false;
+  pixel = frame.cam_->world2cam(camera);
+  // Check floating coordinates before integer conversion, including points
+  // nearly on the camera plane whose projection can overflow an integer.
+  return pixel.allFinite() && pixel.x() >= border && pixel.y() >= border &&
+         pixel.x() < frame.cam_->width() - border && pixel.y() < frame.cam_->height() - border;
+}
+
 M3D projectToSO3(const M3D &rot)
 {
   Eigen::JacobiSVD<M3D> svd(rot, Eigen::ComputeFullU | Eigen::ComputeFullV);
@@ -29,6 +65,103 @@ M3D projectToSO3(const M3D &rot)
     projected = u * v.transpose();
   }
   return projected;
+}
+
+bool stateIsFinite(const StatesGroup &state)
+{
+  return state.rot_end.allFinite() && state.pos_end.allFinite() && state.vel_end.allFinite() &&
+         state.bias_g.allFinite() && state.bias_a.allFinite() && state.gravity.allFinite() &&
+         std::isfinite(state.inv_expo_time) && state.cov.allFinite();
+}
+
+bool visualStateUpdateIsSane(const StatesGroup &before, const StatesGroup &after)
+{
+  if (!stateIsFinite(before) || !stateIsFinite(after)) return false;
+
+  const M3D relative_rotation = before.rot_end.transpose() * after.rot_end;
+  if (!relative_rotation.allFinite()) return false;
+  const double cos_angle = std::clamp((relative_rotation.trace() - 1.0) * 0.5, -1.0, 1.0);
+  const double rotation_step = std::acos(cos_angle);
+
+  // These are failure guards, not estimator tuning limits. A single camera
+  // frame must never move a ground robot by metres or change an IMU state by
+  // orders of magnitude. Such an update is a numerical failure and would
+  // otherwise turn into Inf when the following LiDAR query is cast to float.
+  return rotation_step <= kMaxRotationStepRad &&
+         (after.pos_end - before.pos_end).norm() <= kMaxPositionStepM &&
+         (after.vel_end - before.vel_end).norm() <= kMaxVelocityStepMps &&
+         (after.bias_g - before.bias_g).norm() <= kMaxGyroBiasStepRadps &&
+         (after.bias_a - before.bias_a).norm() <= kMaxAccelBiasStepMps2 &&
+         (after.gravity - before.gravity).norm() <= kMaxGravityStepMps2 &&
+         std::abs(after.inv_expo_time - before.inv_expo_time) <= kMaxInverseExposureStep;
+}
+
+bool visualIncrementIsSane(const Matrix<double, DIM_STATE, 1> &increment)
+{
+  return increment.allFinite() &&
+         increment.block<3, 1>(0, 0).norm() <= kMaxRotationStepRad &&
+         increment.block<3, 1>(3, 0).norm() <= kMaxPositionStepM &&
+         std::abs(increment(6, 0)) <= kMaxInverseExposureStep &&
+         increment.block<3, 1>(7, 0).norm() <= kMaxVelocityStepMps &&
+         increment.block<3, 1>(10, 0).norm() <= kMaxGyroBiasStepRadps &&
+         increment.block<3, 1>(13, 0).norm() <= kMaxAccelBiasStepMps2 &&
+         increment.block<3, 1>(16, 0).norm() <= kMaxGravityStepMps2;
+}
+
+bool invertSymmetricPositiveMatrix(const Matrix<double, DIM_STATE, DIM_STATE> &matrix,
+                                   Matrix<double, DIM_STATE, DIM_STATE> &inverse)
+{
+  using StateMatrix = Matrix<double, DIM_STATE, DIM_STATE>;
+  if (!matrix.allFinite()) return false;
+
+  const StateMatrix symmetric = 0.5 * (matrix + matrix.transpose());
+  Eigen::SelfAdjointEigenSolver<StateMatrix> solver(symmetric);
+  if (solver.info() != Eigen::Success || !solver.eigenvalues().allFinite()) return false;
+
+  const double max_abs_eigenvalue = solver.eigenvalues().cwiseAbs().maxCoeff();
+  const double negative_tolerance = std::max(1e-12, max_abs_eigenvalue * 1e-9);
+  if (solver.eigenvalues().minCoeff() < -negative_tolerance) return false;
+
+  const double eigenvalue_floor = std::max(1e-12, max_abs_eigenvalue * 1e-12);
+  const auto inverse_eigenvalues = solver.eigenvalues().cwiseMax(eigenvalue_floor).cwiseInverse();
+  inverse = solver.eigenvectors() * inverse_eigenvalues.asDiagonal() * solver.eigenvectors().transpose();
+  return inverse.allFinite();
+}
+
+bool computeStableNormalInverse(const Matrix<double, DIM_STATE, DIM_STATE> &covariance,
+                                const Matrix<double, DIM_STATE, DIM_STATE> &hessian,
+                                const double image_point_covariance,
+                                Matrix<double, DIM_STATE, DIM_STATE> &normal_inverse)
+{
+  using StateMatrix = Matrix<double, DIM_STATE, DIM_STATE>;
+  if (!std::isfinite(image_point_covariance) || image_point_covariance <= 0.0 || !hessian.allFinite()) return false;
+
+  StateMatrix covariance_inverse;
+  if (!invertSymmetricPositiveMatrix(covariance, covariance_inverse)) return false;
+
+  const StateMatrix normal_matrix =
+      0.5 * (hessian + hessian.transpose()) + image_point_covariance * covariance_inverse;
+  return invertSymmetricPositiveMatrix(normal_matrix, normal_inverse);
+}
+
+bool stabilizeCovariance(const Matrix<double, DIM_STATE, DIM_STATE> &candidate,
+                         Matrix<double, DIM_STATE, DIM_STATE> &stabilized)
+{
+  using StateMatrix = Matrix<double, DIM_STATE, DIM_STATE>;
+  if (!candidate.allFinite()) return false;
+
+  const StateMatrix symmetric = 0.5 * (candidate + candidate.transpose());
+  Eigen::SelfAdjointEigenSolver<StateMatrix> solver(symmetric);
+  if (solver.info() != Eigen::Success || !solver.eigenvalues().allFinite()) return false;
+
+  const double max_abs_eigenvalue = solver.eigenvalues().cwiseAbs().maxCoeff();
+  const double negative_tolerance = std::max(1e-12, max_abs_eigenvalue * 1e-8);
+  if (solver.eigenvalues().minCoeff() < -negative_tolerance) return false;
+
+  const double eigenvalue_floor = std::max(1e-12, max_abs_eigenvalue * 1e-12);
+  const auto stabilized_eigenvalues = solver.eigenvalues().cwiseMax(eigenvalue_floor);
+  stabilized = solver.eigenvectors() * stabilized_eigenvalues.asDiagonal() * solver.eigenvectors().transpose();
+  return stabilized.allFinite();
 }
 } // namespace
 
@@ -224,6 +357,9 @@ void VIOManager::computeProjectionJacobian(V3D p, MD(2, 3) & J)
 
 void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
 {
+  if (!fast_livo2::visualPatchInBounds(img.cols, img.rows, pc.x(), pc.y(), patch_size, level, false))
+    throw std::out_of_range("Visual reference patch outside image");
+  const auto stride = static_cast<std::ptrdiff_t>(img.step[0]);
   const float u_ref = pc[0];
   const float v_ref = pc[1];
   const int scale = (1 << level);
@@ -237,26 +373,18 @@ void VIOManager::getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level)
   const float w_ref_br = subpix_u_ref * subpix_v_ref;
   for (int x = 0; x < patch_size; x++)
   {
-    uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i - patch_size_half * scale + x * scale) * width + (u_ref_i - patch_size_half * scale);
+    uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i - patch_size_half * scale + x * scale) * stride + (u_ref_i - patch_size_half * scale);
     for (int y = 0; y < patch_size; y++, img_ptr += scale)
     {
       patch_tmp[patch_size_total * level + x * patch_size + y] =
-          w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] + w_ref_br * img_ptr[scale * width + scale];
+          w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * stride] + w_ref_br * img_ptr[scale * stride + scale];
     }
   }
 }
 
 void VIOManager::insertPointIntoVoxelMap(VisualPoint *pt_new)
 {
-  V3D pt_w(pt_new->pos_[0], pt_new->pos_[1], pt_new->pos_[2]);
-  double voxel_size = 0.5;
-  float loc_xyz[3];
-  for (int j = 0; j < 3; j++)
-  {
-    loc_xyz[j] = pt_w[j] / voxel_size;
-    if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-  }
-  VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+  const VOXEL_LOCATION position = visualVoxelLocation(pt_new->pos_);
   auto iter = feat_map.find(position);
   if (iter != feat_map.end())
   {
@@ -373,6 +501,11 @@ double VIOManager::calculateNCC(float *ref_patch, float *cur_patch, int patch_si
 
 void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map)
 {
+  // A temporal reference can expire together with the last map point. Clear
+  // the previous frame's non-owning pointers even when there is no new map.
+  visual_submap->reset();
+  sub_feat_map.clear();
+  total_points = 0;
   if (feat_map.size() <= 0) return;
   double ts0 = omp_get_wtime();
 
@@ -381,13 +514,6 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
   // downSizeFilter.filter(*pg_down);
 
   // resetRvizDisplay();
-  visual_submap->reset();
-
-  // Controls whether to include the visual submap from the previous frame.
-  sub_feat_map.clear();
-
-  float voxel_size = 0.5;
-
   if (!normal_en) warp_map.clear();
 
   cv::Mat depth_img = cv::Mat::zeros(height, width, CV_32FC1);
@@ -397,8 +523,6 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
   // double t_insert, t_depth, t_position;
   // t_insert=t_depth=t_position=0;
-
-  int loc_xyz[3];
 
   // printf("A0. initial depthmap: %.6lf \n", omp_get_wtime() - ts0);
   // double ts1 = omp_get_wtime();
@@ -411,12 +535,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
     V3D pt_w = pg[i].point_w;
 
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = floor(pt_w[j] / voxel_size);
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position(loc_xyz[0], loc_xyz[1], loc_xyz[2]);
+    const VOXEL_LOCATION position = visualVoxelLocation(pt_w);
 
     // t_position += omp_get_wtime()-t0;
     // double t1 = omp_get_wtime();
@@ -430,14 +549,12 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
 
     V3D pt_c(new_frame_->w2f(pt_w));
 
-    if (pt_c[2] > 0)
+    if (pt_c.allFinite() && pt_c[2] > 1e-6)
     {
       V2D px;
       // px[0] = fx * pt_c[0]/pt_c[2] + cx;
       // px[1] = fy * pt_c[1]/pt_c[2]+ cy;
-      px = new_frame_->cam_->world2cam(pt_c);
-
-      if (new_frame_->cam_->isInFrame(px.cast<int>(), border))
+      if (projectVisiblePoint(*new_frame_, pt_w, border, px))
       {
         // cv::circle(img_cp, cv::Point2f(px[0], px[1]), 3, cv::Scalar(0, 0, 255), -1, 8);
         float depth = pt_c[2];
@@ -485,8 +602,8 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         // dir.normalize();
         // if (dir.dot(norm_vec) <= 0.17) continue; // 0.34 70 degree  0.17 80 degree 0.08 85 degree
 
-        V2D pc(new_frame_->w2c(pt->pos_));
-        if (new_frame_->cam_->isInFrame(pc.cast<int>(), border))
+        V2D pc;
+        if (projectVisiblePoint(*new_frame_, pt->pos_, border, pc))
         {
           // cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 3, cv::Scalar(0, 255, 255), -1, 8);
           voxel_in_fov = true;
@@ -527,13 +644,7 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         V3D sample_point_w = new_frame_->f2w(it);
         // sample_points_temp.push_back(sample_point_w);
 
-        for (int j = 0; j < 3; j++)
-        {
-          loc_xyz[j] = floor(sample_point_w[j] / voxel_size);
-          if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-        }
-
-        VOXEL_LOCATION sample_pos(loc_xyz[0], loc_xyz[1], loc_xyz[2]);
+        const VOXEL_LOCATION sample_pos = visualVoxelLocation(sample_point_w);
 
         auto corre_sub_feat_map = sub_feat_map.find(sample_pos);
         if (corre_sub_feat_map != sub_feat_map.end()) break;
@@ -563,9 +674,8 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
             dir.normalize();
             // if (dir.dot(norm_vec) <= 0.17) continue; // 0.34 70 degree 0.17 80 degree 0.08 85 degree
 
-            V2D pc(new_frame_->w2c(pt->pos_));
-
-            if (new_frame_->cam_->isInFrame(pc.cast<int>(), border))
+            V2D pc;
+            if (projectVisiblePoint(*new_frame_, pt->pos_, border, pc))
             {
               // cv::circle(img_cp, cv::Point2f(pc[0], pc[1]), 3, cv::Scalar(255, 255, 0), -1, 8); 
               // sub_map_ray_fov.push_back(pt);
@@ -590,7 +700,6 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
         }
         else
         {
-          VOXEL_LOCATION sample_pos(loc_xyz[0], loc_xyz[1], loc_xyz[2]);
           auto iter = plane_map.find(sample_pos);
           if (iter != plane_map.end())
           {
@@ -803,10 +912,17 @@ void VIOManager::retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &
   printf("[ VIO ] Retrieve %d points from visual sparse map\n", total_points);
 }
 
-void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
+bool VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
 {
-  if (total_points == 0) return;
-  
+  temporal_observation = {};
+  temporal_pixels = 0;
+  if (total_points == 0) return true;
+
+  const StatesGroup state_before_update(*state);
+  // G is reused by the pyramid-level update routines. It must be zero when a
+  // level has no valid measurement; otherwise an old/uninitialized gain can
+  // corrupt the covariance used by the next visual update.
+  G.setZero();
   compute_jacobian_time = update_ekf_time = 0.0;
 
   for (int level = patch_pyrimid_level - 1; level >= 0; level--)
@@ -814,13 +930,36 @@ void VIOManager::computeJacobianAndUpdateEKF(cv::Mat img)
     if (inverse_composition_en)
     {
       has_ref_patch_cache = false;
-      updateStateInverse(img, level);
+      if (!updateStateInverse(img, level))
+      {
+        (*state) = state_before_update;
+        G.setZero();
+        updateFrameState(*state);
+        return false;
+      }
     }
-    else
-      updateState(img, level);
+    else if (!updateState(img, level))
+    {
+      (*state) = state_before_update;
+      G.setZero();
+      updateFrameState(*state);
+      return false;
+    }
   }
-  state->cov -= G * state->cov;
+
+  Matrix<double, DIM_STATE, DIM_STATE> stabilized_covariance;
+  const Matrix<double, DIM_STATE, DIM_STATE> posterior_covariance =
+      (Matrix<double, DIM_STATE, DIM_STATE>::Identity() - G) * state->cov;
+  if (!stabilizeCovariance(posterior_covariance, stabilized_covariance))
+  {
+    (*state) = state_before_update;
+    G.setZero();
+    updateFrameState(*state);
+    return false;
+  }
+  state->cov = stabilized_covariance;
   updateFrameState(*state);
+  return true;
 }
 
 void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
@@ -833,9 +972,8 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
     if (pg[i].normal == V3D(0, 0, 0)) continue;
 
     V3D pt = pg[i].point_w;
-    V2D pc(new_frame_->w2c(pt));
-
-    if (new_frame_->cam_->isInFrame(pc.cast<int>(), border)) // 20px is the patch size in the matcher
+    V2D pc;
+    if (projectVisiblePoint(*new_frame_, pt, border, pc))
     {
       int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
 
@@ -856,9 +994,8 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
   for (int j = 0; j < visual_submap->add_from_voxel_map.size(); j++)
   {
     V3D pt = visual_submap->add_from_voxel_map[j].point_w;
-    V2D pc(new_frame_->w2c(pt));
-
-    if (new_frame_->cam_->isInFrame(pc.cast<int>(), border)) // 20px is the patch size in the matcher
+    V2D pc;
+    if (projectVisiblePoint(*new_frame_, pt, border, pc))
     {
       int index = static_cast<int>(pc[1] / grid_size) * grid_n_width + static_cast<int>(pc[0] / grid_size);
 
@@ -902,8 +1039,10 @@ void VIOManager::generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg)
       Feature *ftr_new = new Feature(pt_new, patch, pc, f, new_frame_->T_f_w_, 0);
       ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
+      ftr_new->temporal_anchor_ = temporal_node_id;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
 
+      pt_new->temporal_anchor_ = temporal_node_id;
       pt_new->addFrameRef(ftr_new);
       pt_new->covariance_ = pt_var.var;
       pt_new->is_normal_initialized_ = true;
@@ -943,7 +1082,8 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       continue;
     }
 
-    V2D pc(new_frame_->w2c(pt->pos_));
+    V2D pc;
+    if (!projectVisiblePoint(*new_frame_, pt->pos_, border, pc)) continue;
     bool add_flag = false;
     
     float *patch_temp = new float[patch_size_total];
@@ -981,8 +1121,15 @@ void VIOManager::updateVisualMapPoints(cv::Mat img)
       Feature *ftr_new = new Feature(pt, patch_temp, pc, f, new_frame_->T_f_w_, visual_submap->search_levels[i]);
       ftr_new->img_ = img;
       ftr_new->id_ = new_frame_->id_;
+      ftr_new->temporal_anchor_ = temporal_node_id;
       ftr_new->inv_expo_time_ = state->inv_expo_time;
       pt->addFrameRef(ftr_new);
+    }
+    else
+    {
+      // No Feature took ownership when this view did not qualify as a new
+      // reference. Release its temporary patch on every such image update.
+      delete[] patch_temp;
     }
   }
   printf("[ VIO ] Update %d points in visual submap\n", update_num);
@@ -1002,13 +1149,7 @@ void VIOManager::updateReferencePatch(const unordered_map<VOXEL_LOCATION, VoxelO
     if (update_flag[i] == 0) continue;
 
     const V3D &p_w = pt->pos_;
-    float loc_xyz[3];
-    for (int j = 0; j < 3; j++)
-    {
-      loc_xyz[j] = p_w[j] / 0.5;
-      if (loc_xyz[j] < 0) { loc_xyz[j] -= 1.0; }
-    }
-    VOXEL_LOCATION position((int64_t)loc_xyz[0], (int64_t)loc_xyz[1], (int64_t)loc_xyz[2]);
+    const VOXEL_LOCATION position = visualVoxelLocation(p_w);
     auto iter = plane_map.find(position);
     if (iter != plane_map.end())
     {
@@ -1365,14 +1506,21 @@ void VIOManager::precomputeReferencePatches(int level)
     const int scale = (1 << level);
 
     VisualPoint *pt = visual_submap->voxel_points[i];
+    if (pt == nullptr || pt->ref_patch == nullptr) continue;
     cv::Mat img = pt->ref_patch->img_;
-
-    if (pt == nullptr) continue;
+    const auto stride = static_cast<std::ptrdiff_t>(img.step[0]);
 
     double depth((pt->pos_ - pt->ref_patch->pos()).norm());
     V3D pf = pt->ref_patch->f_ * depth;
     V2D pc = pt->ref_patch->px_;
     M3D R_ref_w = pt->ref_patch->T_f_w_.rotationMatrix();
+
+    if (!pf.allFinite() || pf.z() <= 1e-6 ||
+        !fast_livo2::visualPatchInBounds(img.cols, img.rows, pc.x(), pc.y(), patch_size, level, true))
+    {
+      ++invalid_patch_evaluations;
+      continue;
+    }
 
     computeProjectionJacobian(pf, Jdpi);
     p_w_hat << SKEW_SYM_MATRX(pt->pos_);
@@ -1390,19 +1538,19 @@ void VIOManager::precomputeReferencePatches(int level)
 
     for (int x = 0; x < patch_size; x++)
     {
-      uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
+      uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * stride + u_ref_i - patch_size_half * scale;
       for (int y = 0; y < patch_size; ++y, img_ptr += scale)
       {
         float du =
             0.5f *
-            ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] + w_ref_bl * img_ptr[scale * width + scale] +
-              w_ref_br * img_ptr[scale * width + scale * 2]) -
-             (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale * width - scale] + w_ref_br * img_ptr[scale * width]));
+            ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] + w_ref_bl * img_ptr[scale * stride + scale] +
+              w_ref_br * img_ptr[scale * stride + scale * 2]) -
+             (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale * stride - scale] + w_ref_br * img_ptr[scale * stride]));
         float dv =
             0.5f *
-            ((w_ref_tl * img_ptr[scale * width] + w_ref_tr * img_ptr[scale + scale * width] + w_ref_bl * img_ptr[width * scale * 2] +
-              w_ref_br * img_ptr[width * scale * 2 + scale]) -
-             (w_ref_tl * img_ptr[-scale * width] + w_ref_tr * img_ptr[-scale * width + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
+            ((w_ref_tl * img_ptr[scale * stride] + w_ref_tr * img_ptr[scale + scale * stride] + w_ref_bl * img_ptr[stride * scale * 2] +
+              w_ref_br * img_ptr[stride * scale * 2 + scale]) -
+             (w_ref_tl * img_ptr[-scale * stride] + w_ref_tr * img_ptr[-scale * stride + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
 
         Jimg << du, dv;
         Jimg = Jimg * (1.0 / scale);
@@ -1417,9 +1565,10 @@ void VIOManager::precomputeReferencePatches(int level)
   has_ref_patch_cache = true;
 }
 
-void VIOManager::updateStateInverse(cv::Mat img, int level)
+bool VIOManager::updateStateInverse(cv::Mat img, int level)
 {
-  if (total_points == 0) return;
+  const auto stride = static_cast<std::ptrdiff_t>(img.step[0]);
+  if (total_points == 0) return true;
   StatesGroup old_state = (*state);
   V2D pc;
   MD(1, 2) Jimg;
@@ -1442,10 +1591,14 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
 
   for (int iteration = 0; iteration < max_iterations; iteration++)
   {
+    // A feature may leave the image after a state update. Never reuse its old rows.
+    z.setZero();
+    H_sub.setZero();
     double t1 = omp_get_wtime();
     double count_outlier = 0;
     if (has_ref_patch_cache == false) precomputeReferencePatches(level);
     int n_meas = 0;
+    int invalid_patches = 0;
     float error = 0.0;
     M3D Rwi(state->rot_end);
     V3D Pwi(state->pos_end);
@@ -1466,7 +1619,17 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       if (pt == nullptr) continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (!pf.allFinite() || pf.z() <= 1e-6)
+      {
+        ++invalid_patches;
+        continue;
+      }
       pc = cam->world2cam(pf);
+      if (!fast_livo2::visualPatchInBounds(img.cols, img.rows, pc.x(), pc.y(), patch_size, level, false) || H_sub_inv.block(i * patch_size_total, 0, patch_size_total, 6).squaredNorm() == 0)
+      {
+        ++invalid_patches;
+        continue;
+      }
 
       const float u_ref = pc[0];
       const float v_ref = pc[1];
@@ -1482,11 +1645,11 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       vector<float> P = visual_submap->warp_patch[i];
       for (int x = 0; x < patch_size; x++)
       {
-        uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
+        uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * stride + u_ref_i - patch_size_half * scale;
         for (int y = 0; y < patch_size; ++y, img_ptr += scale)
         {
-          double res = w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] +
-                       w_ref_br * img_ptr[scale * width + scale] - P[patch_size_total * level + x * patch_size + y];
+          double res = w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * stride] +
+                       w_ref_br * img_ptr[scale * stride + scale] - P[patch_size_total * level + x * patch_size + y];
           z(i * patch_size_total + x * patch_size + y) = res;
           patch_error += res * res;
           MD(1, 3) J_dR = H_sub_inv.block<1, 3>(i * patch_size_total + x * patch_size + y, 0);
@@ -1501,7 +1664,10 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
       error += patch_error;
     }
 
+    invalid_patch_evaluations += invalid_patches;
+    if (n_meas <= 0) return true;
     error = error / n_meas;
+    if (!std::isfinite(error) || !z.allFinite() || !H_sub.allFinite()) return false;
 
     compute_jacobian_time += omp_get_wtime() - t1;
 
@@ -1511,16 +1677,28 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
     {
       old_state = (*state);
       last_error = error;
+      if (temporal_commit && level == 0)
+      {
+        captureTemporalObservation(H_sub, z);
+        temporal_pixels = n_meas;
+      }
 
       auto &&H_sub_T = H_sub.transpose();
       H_T_H.setZero();
       G.setZero();
       H_T_H.block<6, 6>(0, 0) = H_sub_T * H_sub;
-      MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+      MD(DIM_STATE, DIM_STATE) K_1;
+      if (!computeStableNormalInverse(state->cov, H_T_H, img_point_cov, K_1)) return false;
       auto &&HTz = H_sub_T * z;
       auto vec = (*state_propagat) - (*state);
       G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
       auto solution = -K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+      if (!visualIncrementIsSane(solution))
+      {
+        (*state) = old_state;
+        G.setZero();
+        return false;
+      }
       (*state) += solution;
       auto &&rot_add = solution.block<3, 1>(0, 0);
       auto &&t_add = solution.block<3, 1>(3, 0);
@@ -1537,11 +1715,13 @@ void VIOManager::updateStateInverse(cv::Mat img, int level)
 
     if (iteration == max_iterations || EKF_end) break; 
   }
+  return true;
 }
 
-void VIOManager::updateState(cv::Mat img, int level)
+bool VIOManager::updateState(cv::Mat img, int level)
 {
-  if (total_points == 0) return;
+  const auto stride = static_cast<std::ptrdiff_t>(img.step[0]);
+  if (total_points == 0) return true;
   StatesGroup old_state = (*state);
 
   VectorXd z;
@@ -1557,6 +1737,9 @@ void VIOManager::updateState(cv::Mat img, int level)
 
   for (int iteration = 0; iteration < max_iterations; iteration++)
   {
+    // A feature may leave the image after a state update. Never reuse its old rows.
+    z.setZero();
+    H_sub.setZero();
     double t1 = omp_get_wtime();
 
     M3D Rwi(state->rot_end);
@@ -1567,13 +1750,14 @@ void VIOManager::updateState(cv::Mat img, int level)
     
     float error = 0.0;
     int n_meas = 0;
+    int invalid_patches = 0;
     // int max_threads = omp_get_max_threads();
     // int desired_threads = std::min(max_threads, total_points);
     // omp_set_num_threads(desired_threads);
   
     #ifdef MP_EN
       omp_set_num_threads(std::getenv("FAST_LIVO2_DETERMINISTIC") != nullptr ? 1 : MP_PROC_NUM);
-      #pragma omp parallel for reduction(+:error, n_meas)
+      #pragma omp parallel for reduction(+:error, n_meas, invalid_patches)
     #endif
     for (int i = 0; i < total_points; i++)
     {
@@ -1593,7 +1777,17 @@ void VIOManager::updateState(cv::Mat img, int level)
       if (pt == nullptr) continue;
 
       V3D pf = Rcw * pt->pos_ + Pcw;
+      if (!pf.allFinite() || pf.z() <= 1e-6)
+      {
+        ++invalid_patches;
+        continue;
+      }
       V2D pc = cam->world2cam(pf);
+      if (!fast_livo2::visualPatchInBounds(img.cols, img.rows, pc.x(), pc.y(), patch_size, pyramid_level, true))
+      {
+        ++invalid_patches;
+        continue;
+      }
 
       computeProjectionJacobian(pf, Jdpi);
       M3D p_hat;
@@ -1616,19 +1810,19 @@ void VIOManager::updateState(cv::Mat img, int level)
 
       for (int x = 0; x < patch_size; x++)
       {
-        uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * width + u_ref_i - patch_size_half * scale;
+        uint8_t *img_ptr = (uint8_t *)img.data + (v_ref_i + x * scale - patch_size_half * scale) * stride + u_ref_i - patch_size_half * scale;
         for (int y = 0; y < patch_size; ++y, img_ptr += scale)
         {
           float du =
               0.5f *
-              ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] + w_ref_bl * img_ptr[scale * width + scale] +
-                w_ref_br * img_ptr[scale * width + scale * 2]) -
-               (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale * width - scale] + w_ref_br * img_ptr[scale * width]));
+              ((w_ref_tl * img_ptr[scale] + w_ref_tr * img_ptr[scale * 2] + w_ref_bl * img_ptr[scale * stride + scale] +
+                w_ref_br * img_ptr[scale * stride + scale * 2]) -
+               (w_ref_tl * img_ptr[-scale] + w_ref_tr * img_ptr[0] + w_ref_bl * img_ptr[scale * stride - scale] + w_ref_br * img_ptr[scale * stride]));
           float dv =
               0.5f *
-              ((w_ref_tl * img_ptr[scale * width] + w_ref_tr * img_ptr[scale + scale * width] + w_ref_bl * img_ptr[width * scale * 2] +
-                w_ref_br * img_ptr[width * scale * 2 + scale]) -
-               (w_ref_tl * img_ptr[-scale * width] + w_ref_tr * img_ptr[-scale * width + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
+              ((w_ref_tl * img_ptr[scale * stride] + w_ref_tr * img_ptr[scale + scale * stride] + w_ref_bl * img_ptr[stride * scale * 2] +
+                w_ref_br * img_ptr[stride * scale * 2 + scale]) -
+               (w_ref_tl * img_ptr[-scale * stride] + w_ref_tr * img_ptr[-scale * stride + scale] + w_ref_bl * img_ptr[0] + w_ref_br * img_ptr[scale]));
 
           Jimg << du, dv;
           Jimg = Jimg * state->inv_expo_time;
@@ -1639,7 +1833,7 @@ void VIOManager::updateState(cv::Mat img, int level)
           Jdt = Jdp * Jdp_dt;
 
           double cur_value =
-              w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * width] + w_ref_br * img_ptr[scale * width + scale];
+              w_ref_tl * img_ptr[0] + w_ref_tr * img_ptr[scale] + w_ref_bl * img_ptr[scale * stride] + w_ref_br * img_ptr[scale * stride + scale];
           double res = state->inv_expo_time * cur_value - inv_ref_expo * P[patch_size_total * level + x * patch_size + y];
 
           z(i * patch_size_total + x * patch_size + y) = res;
@@ -1655,7 +1849,10 @@ void VIOManager::updateState(cv::Mat img, int level)
       error += patch_error;
     }
 
+    invalid_patch_evaluations += invalid_patches;
+    if (n_meas <= 0) return true;
     error = error / n_meas;
+    if (!std::isfinite(error) || !z.allFinite() || !H_sub.allFinite()) return false;
     
     compute_jacobian_time += omp_get_wtime() - t1;
 
@@ -1671,6 +1868,11 @@ void VIOManager::updateState(cv::Mat img, int level)
     {
       old_state = (*state);
       last_error = error;
+      if (temporal_commit && level == 0)
+      {
+        captureTemporalObservation(H_sub, z);
+        temporal_pixels = n_meas;
+      }
 
       // K = (H.transpose() / img_point_cov * H + state->cov.inverse()).inverse() * H.transpose() / img_point_cov; auto
       // vec = (*state_propagat) - (*state); G = K*H;
@@ -1680,7 +1882,8 @@ void VIOManager::updateState(cv::Mat img, int level)
       H_T_H.setZero();
       G.setZero();
       H_T_H.block<7, 7>(0, 0) = H_sub_T * H_sub;
-      MD(DIM_STATE, DIM_STATE) &&K_1 = (H_T_H + (state->cov / img_point_cov).inverse()).inverse();
+      MD(DIM_STATE, DIM_STATE) K_1;
+      if (!computeStableNormalInverse(state->cov, H_T_H, img_point_cov, K_1)) return false;
       auto &&HTz = H_sub_T * z;
       // K = K_1.block<DIM_STATE,6>(0,0) * H_sub_T;
       auto vec = (*state_propagat) - (*state);
@@ -1688,6 +1891,12 @@ void VIOManager::updateState(cv::Mat img, int level)
       MD(DIM_STATE, 1)
       solution = -K_1.block<DIM_STATE, 7>(0, 0) * HTz + vec - G.block<DIM_STATE, 7>(0, 0) * vec.block<7, 1>(0, 0);
 
+      if (!visualIncrementIsSane(solution))
+      {
+        (*state) = old_state;
+        G.setZero();
+        return false;
+      }
       (*state) += solution;
       auto &&rot_add = solution.block<3, 1>(0, 0);
       auto &&t_add = solution.block<3, 1>(3, 0);
@@ -1707,6 +1916,7 @@ void VIOManager::updateState(cv::Mat img, int level)
     if (iteration == max_iterations || EKF_end) break;
   }
   // if (state->inv_expo_time < 0.0)  {ROS_ERROR("reset expo time!!!!!!!!!!\n"); state->inv_expo_time = 0.0;}
+  return true;
 }
 
 void VIOManager::updateFrameState(StatesGroup state)
@@ -1805,8 +2015,9 @@ void VIOManager::dumpDataForColmap()
   cnt++;
 }
 
-void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time)
+bool VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time)
 {
+  invalid_patch_evaluations = 0;
   if (width != img.cols || height != img.rows)
   {
     if (img.empty()) printf("[ VIO ] Empty Image!\n");
@@ -1829,7 +2040,32 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   double t2 = omp_get_wtime();
 
-  computeJacobianAndUpdateEKF(img);
+  const StatesGroup state_before_visual_update(*state);
+  const bool ekf_update_valid = computeJacobianAndUpdateEKF(img);
+
+  if (!ekf_update_valid || !visualStateUpdateIsSane(state_before_visual_update, *state))
+  {
+    const double position_step = state->pos_end.allFinite()
+                                     ? (state->pos_end - state_before_visual_update.pos_end).norm()
+                                     : std::numeric_limits<double>::infinity();
+    const double velocity_step = state->vel_end.allFinite()
+                                     ? (state->vel_end - state_before_visual_update.vel_end).norm()
+                                     : std::numeric_limits<double>::infinity();
+    std::cerr << "[ VIO ] Rejected non-finite or catastrophic visual state update"
+              << " (position step: " << position_step
+              << " m, velocity step: " << velocity_step << " m/s)." << std::endl;
+    (*state) = state_before_visual_update;
+    G.setZero();
+    updateFrameState(*state);
+    return false;
+  }
+
+  if (temporal_commit && !temporal_commit()) {
+    (*state) = state_before_visual_update;
+    updateFrameState(*state);
+    return false;
+  }
+  updateFrameState(*state);
 
   double t3 = omp_get_wtime();
 
@@ -1843,11 +2079,13 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
 
   double t5 = omp_get_wtime();
 
-  updateVisualMapPoints(img);
+  // Keep the image template and measured point attached to the same pose.
+  // Joint-reference mode replaces them when that anchor leaves the window.
+  if (!temporal_joint_reference) updateVisualMapPoints(img);
 
   double t6 = omp_get_wtime();
 
-  updateReferencePatch(feat_map);
+  if (!temporal_joint_reference) updateReferencePatch(feat_map);
 
   double t7 = omp_get_wtime();
   
@@ -1889,10 +2127,23 @@ void VIOManager::processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unor
   printf("\033[1;32m| %-29s | %-27lf |\033[0m\n", "Average Total Time", ave_total);
   printf("\033[1;34m+-------------------------------------------------------------+\033[0m\n");
 
+  // No code after the EKF is intended to modify the navigation state. Keep a
+  // second transaction boundary here as protection against an out-of-bounds
+  // visual-map operation corrupting adjacent estimator memory.
+  if (!visualStateUpdateIsSane(state_before_visual_update, *state))
+  {
+    std::cerr << "[ VIO ] Rejected visual frame because the state changed during visual-map maintenance." << std::endl;
+    (*state) = state_before_visual_update;
+    G.setZero();
+    updateFrameState(*state);
+    return false;
+  }
+
   // std::string text = std::to_string(int(1 / (t7 - t1 - (t5 - t4)))) + " HZ";
   // cv::Point2f origin;
   // origin.x = 20;
   // origin.y = 20;
   // cv::putText(img_cp, text, origin, cv::FONT_HERSHEY_COMPLEX, 0.6, cv::Scalar(255, 255, 255), 1, 8, 0);
   // cv::imwrite("/home/chunran/Desktop/raycasting/" + std::to_string(new_frame_->id_) + ".png", img_cp);
+  return true;
 }

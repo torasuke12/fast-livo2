@@ -11,6 +11,9 @@ which is included as part of this source code package.
 */
 
 #include "LIVMapper.h"
+#include "temporal_scan.h"
+#include "point_uncertainty.h"
+#include <filesystem>
 
 #include <chrono>
 #include <functional>
@@ -30,8 +33,14 @@ LIVMapper::LIVMapper(const rclcpp::Node::SharedPtr &node)
   p_imu.reset(new ImuProcess());
 
   readParameters();
+  configureTemporalLIO();
   VoxelMapConfig voxel_config;
   loadVoxelConfig(node_, voxel_config);
+  if (temporal_enabled_)
+  {
+    voxel_config.diagnostics_.enabled = false;
+    voxel_config.xicp_.enabled = false;
+  }
 
   visual_sub_map.reset(new PointCloudXYZI());
   feats_undistort.reset(new PointCloudXYZI());
@@ -74,6 +83,9 @@ void LIVMapper::readParameters()
   patch_pyrimid_level = fast_livo2::declareOrGet<int>(node_, "vio/patch_pyrimid_level", 3);
   patch_size = fast_livo2::declareOrGet<int>(node_, "vio/patch_size", 8);
   outlier_threshold = fast_livo2::declareOrGet<double>(node_, "vio/outlier_threshold", 1000.0);
+  image_interval_sec = fast_livo2::declareOrGet<double>(node_, "vio/image_interval_sec", 0.02);
+  if(!std::isfinite(image_interval_sec) || image_interval_sec<0.02 || image_interval_sec>1.)
+    throw std::invalid_argument("vio.image_interval_sec must be in [0.02, 1.0]");
 
   exposure_time_init = fast_livo2::declareOrGet<double>(node_, "time_offset/exposure_time_init", 0.0);
   img_time_offset = fast_livo2::declareOrGet<double>(node_, "time_offset/img_time_offset", 0.0);
@@ -86,10 +98,16 @@ void LIVMapper::readParameters()
   pose_output_en = fast_livo2::declareOrGet<bool>(node_, "evo/pose_output_en", false);
   gyr_cov = fast_livo2::declareOrGet<double>(node_, "imu/gyr_cov", 1.0);
   acc_cov = fast_livo2::declareOrGet<double>(node_, "imu/acc_cov", 1.0);
+  gyro_bias_cov = fast_livo2::declareOrGet<double>(node_, "imu/gyro_bias_cov", 0.0001);
+  accel_bias_cov = fast_livo2::declareOrGet<double>(node_, "imu/accel_bias_cov", 0.0001);
+  if(!std::isfinite(gyro_bias_cov) || gyro_bias_cov<=0 || !std::isfinite(accel_bias_cov) || accel_bias_cov<=0)
+    throw std::invalid_argument("IMU bias process variances must be finite and positive");
   imu_int_frame = fast_livo2::declareOrGet<int>(node_, "imu/imu_int_frame", 3);
   imu_en = fast_livo2::declareOrGet<bool>(node_, "imu/imu_en", true);
   gravity_est_en = fast_livo2::declareOrGet<bool>(node_, "imu/gravity_est_en", true);
   ba_bg_est_en = fast_livo2::declareOrGet<bool>(node_, "imu/ba_bg_est_en", true);
+  imu_init_duration_sec = fast_livo2::declareOrGet<double>(node_, "imu/imu_init_duration_sec", 0.0);
+  if (!std::isfinite(imu_init_duration_sec) || imu_init_duration_sec < 0.0) imu_init_duration_sec = 0.0;
   stationary_gyr_mean_threshold = fast_livo2::declareOrGet<double>(node_, "imu/stationary_gyr_mean_threshold", 0.1);
   stationary_gyr_std_threshold = fast_livo2::declareOrGet<double>(node_, "imu/stationary_gyr_std_threshold", 0.02);
   stationary_acc_std_ratio_threshold = fast_livo2::declareOrGet<double>(node_, "imu/stationary_acc_std_ratio_threshold", 0.05);
@@ -124,6 +142,7 @@ void LIVMapper::readParameters()
   extrinR = fast_livo2::declareOrGet<vector<double>>(node_, "extrin_calib/extrinsic_R", extrinR);
   cameraextrinT = fast_livo2::declareOrGet<vector<double>>(node_, "extrin_calib/Pcl", cameraextrinT);
   cameraextrinR = fast_livo2::declareOrGet<vector<double>>(node_, "extrin_calib/Rcl", cameraextrinR);
+  debug_log_dir = fast_livo2::declareOrGet<std::string>(node_, "debug/log_dir", "");
   plot_time = fast_livo2::declareOrGet<double>(node_, "debug/plot_time", -10.0);
   frame_cnt = fast_livo2::declareOrGet<int>(node_, "debug/frame_cnt", 6);
 
@@ -189,9 +208,10 @@ void LIVMapper::initializeComponents()
   p_imu->set_gyr_cov_scale(V3D(gyr_cov, gyr_cov, gyr_cov));
   p_imu->set_acc_cov_scale(V3D(acc_cov, acc_cov, acc_cov));
   p_imu->set_inv_expo_cov(inv_expo_cov);
-  p_imu->set_gyr_bias_cov(V3D(0.0001, 0.0001, 0.0001));
-  p_imu->set_acc_bias_cov(V3D(0.0001, 0.0001, 0.0001));
+  p_imu->set_gyr_bias_cov(V3D::Constant(gyro_bias_cov));
+  p_imu->set_acc_bias_cov(V3D::Constant(accel_bias_cov));
   p_imu->set_imu_init_frame_num(imu_int_frame);
+  p_imu->set_imu_init_duration(imu_init_duration_sec);
   p_imu->set_imu_stationary_thresholds(stationary_gyr_mean_threshold,
                                        stationary_gyr_std_threshold,
                                        stationary_acc_std_ratio_threshold);
@@ -227,8 +247,16 @@ void LIVMapper::initializeFiles()
   if(colmap_output_en) fout_points.open(std::string(ROOT_DIR) + "Log/Colmap/sparse/0/points3D.txt", std::ios::out);
   if(pcd_save_en) fout_lidar_pos.open(std::string(ROOT_DIR) + "Log/pcd/lidar_poses.txt", std::ios::out);
   if(img_save_en) fout_visual_pos.open(std::string(ROOT_DIR) + "Log/image/image_poses.txt", std::ios::out);
-  fout_pre.open(DEBUG_FILE_DIR("mat_pre.txt"), std::ios::out);
-  fout_out.open(DEBUG_FILE_DIR("mat_out.txt"), std::ios::out);
+  if (!debug_log_dir.empty()) std::filesystem::create_directories(debug_log_dir);
+  const auto log_dir = debug_log_dir.empty() ? std::filesystem::path(ROOT_DIR) / "Log" : std::filesystem::path(debug_log_dir);
+  fout_pre.open(log_dir / "mat_pre.txt", std::ios::out);
+  fout_out.open(log_dir / "mat_out.txt", std::ios::out);
+  if (!debug_log_dir.empty())
+  {
+    if (!fout_pre || !fout_out) throw std::runtime_error("Cannot open debug.log_dir state logs: " + debug_log_dir);
+    // Open before bag playback, so a capture fails early if its destination is unusable.
+    p_imu->set_log_directory(debug_log_dir);
+  }
 }
 
 void LIVMapper::initializeSubscribersAndPublishers()
@@ -259,8 +287,10 @@ void LIVMapper::initializeSubscribersAndPublishers()
   pubSubVisualMap = fast_livo2::Publisher(node_->create_publisher<sensor_msgs::PointCloud2>("/cloud_visual_sub_map_before", 100));
   pubLaserCloudEffect = fast_livo2::Publisher(node_->create_publisher<sensor_msgs::PointCloud2>("/cloud_effected", 100));
   pubLaserCloudMap = fast_livo2::Publisher(node_->create_publisher<sensor_msgs::PointCloud2>("/Laser_map", 1));
+  // Keep the latest revised trajectory available to late subscribers.
+  const auto snapshot_qos = rclcpp::QoS(rclcpp::KeepLast(1)).reliable().transient_local();
   pubOdomAftMapped = fast_livo2::Publisher(node_->create_publisher<nav_msgs::Odometry>("/aft_mapped_to_init", 10));
-  pubPath = fast_livo2::Publisher(node_->create_publisher<nav_msgs::Path>("/path", 10));
+  pubPath = fast_livo2::Publisher(node_->create_publisher<nav_msgs::Path>("/path", snapshot_qos));
   plane_pub = fast_livo2::Publisher(node_->create_publisher<visualization_msgs::Marker>("/planner_normal", 1));
   voxel_pub = fast_livo2::Publisher(node_->create_publisher<visualization_msgs::MarkerArray>("/voxels", 1));
   pubLaserCloudDyn = fast_livo2::Publisher(node_->create_publisher<sensor_msgs::PointCloud2>("/dyn_obj", 100));
@@ -306,6 +336,13 @@ void LIVMapper::processImu()
 {
   // double t0 = omp_get_wtime();
 
+  if (temporal_enabled_) {
+    // LIVO cuts returns at image times and rebases curvature to the previous
+    // LIO time. Capture that origin before Process2 advances it.
+    if (LidarMeasures.lio_vio_flg == LIO)
+      temporal_scan_begin_time_ = slam_mode_ == LIVO ? LidarMeasures.last_lio_update_time : LidarMeasures.lidar_frame_beg_time;
+    collectTemporalImu();
+  }
   p_imu->Process2(LidarMeasures, _state, feats_undistort);
 
   if (gravity_align_en) gravityAlignment();
@@ -337,6 +374,10 @@ void LIVMapper::stateEstimationAndMapping()
 
 void LIVMapper::handleVIO() 
 {
+  if (temporal_enabled_) { handleTemporalVIO(); return; }
+  // A pending voxel-plane seed must not create visual references or update
+  // the shared state before its geometry has passed the initialization gate.
+  if (!lidar_map_inited) return;
   euler_cur = RotMtoEuler(_state.rot_end);
   fout_pre << std::setw(20) << LidarMeasures.last_lio_update_time - _first_lidar_time << " " << euler_cur.transpose() * 57.3 << " "
             << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
@@ -397,11 +438,13 @@ void LIVMapper::handleLIO()
            << _state.pos_end.transpose() << " " << _state.vel_end.transpose() << " " << _state.bias_g.transpose() << " "
            << _state.bias_a.transpose() << " " << V3D(_state.inv_expo_time, 0, 0).transpose() << endl;
            
-  if (feats_undistort->empty() || (feats_undistort == nullptr)) 
+  if (feats_undistort == nullptr || feats_undistort->empty())
   {
     std::cout << "[ LIO ]: No point!!!" << std::endl;
     return;
   }
+
+  if (temporal_enabled_) { handleTemporalLIO(); return; }
 
   double t0 = omp_get_wtime();
 
@@ -418,8 +461,15 @@ void LIVMapper::handleLIO()
   
   if (!lidar_map_inited) 
   {
-    lidar_map_inited = true;
-    voxelmap_manager->BuildVoxelMap();
+    if (voxelmap_manager->config_setting_.correspondence_mode_ == "voxel_plane")
+    {
+      lidar_map_inited = voxelmap_manager->TryInitializeVoxelMap(LidarMeasures.last_lio_update_time);
+    }
+    else
+    {
+      voxelmap_manager->BuildVoxelMap();
+      lidar_map_inited = voxelmap_manager->FastLioMapReady();
+    }
     // FAST-LIO returns immediately after constructing the initial map.  Do
     // not match the seed scan against itself or insert it a second time: that
     // produces an artificial zero-residual update and overconfident state.
@@ -428,7 +478,7 @@ void LIVMapper::handleLIO()
 
   double t1 = omp_get_wtime();
 
-  voxelmap_manager->StateEstimation(state_propagat);
+  voxelmap_manager->StateEstimation(state_propagat, LidarMeasures.last_lio_update_time - _first_lidar_time);
   _state = voxelmap_manager->state_;
   _pv_list = voxelmap_manager->pv_list_;
 
@@ -473,20 +523,22 @@ void LIVMapper::handleLIO()
 
   PointCloudXYZI::Ptr world_lidar(new PointCloudXYZI());
   transformLidar(_state.rot_end, _state.pos_end, feats_down_body, world_lidar);
-  const M3D matching_rot_cov = voxelmap_manager->boundedStateCovarianceBlock(0);
-  const M3D matching_pos_cov = voxelmap_manager->boundedStateCovarianceBlock(3);
+  const auto matching_pose_cov = fast_livo2::boundedPoseCovariance(_state.cov.topLeftCorner<6,6>(),
+      voxelmap_manager->config_setting_.max_state_cov_for_matching_);
   for (size_t i = 0; i < world_lidar->points.size(); i++) 
   {
     voxelmap_manager->pv_list_[i].point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
-    M3D point_crossmat = voxelmap_manager->cross_mat_list_[i];
-    M3D var = voxelmap_manager->body_cov_list_[i];
-    var = (_state.rot_end * extR) * var * (_state.rot_end * extR).transpose() +
-          (-point_crossmat) * matching_rot_cov * (-point_crossmat).transpose() + matching_pos_cov;
+    const auto& point=feats_down_body->points[i];
+    const V3D point_imu=extR*V3D(point.x,point.y,point.z)+extT;
+    const M3D var=fast_livo2::worldPointCovariance(point_imu,_state.rot_end,extR,
+        voxelmap_manager->body_cov_list_[i],matching_pose_cov);
     voxelmap_manager->pv_list_[i].var = var;
   }
   voxelmap_manager->UpdateVoxelMap(voxelmap_manager->pv_list_);
-  voxelmap_manager->UpdateKnnPointMap(world_lidar);
-  std::cout << "[ LIO ] Update Voxel Map" << std::endl;
+  voxelmap_manager->UpdateFastLioMap(world_lidar);
+  std::cout << (voxelmap_manager->config_setting_.correspondence_mode_ == "fastlio_ikdtree"
+                    ? "[ LIO ] Update voxel-plane and FAST-LIO ikd-tree maps"
+                    : "[ LIO ] Update voxel-plane map") << std::endl;
   _pv_list = voxelmap_manager->pv_list_;
   
   double t4 = omp_get_wtime();
@@ -599,10 +651,14 @@ void LIVMapper::savePCD()
 
 void LIVMapper::run() 
 {
+  // Keep the executor alive across iterations. spin_some(node_) constructs
+  // one each time and can race SIGINT after the loop's context check.
+  rclcpp::executors::SingleThreadedExecutor executor;
+  executor.add_node(node_);
   rclcpp::Rate rate(5000);
   while (rclcpp::ok()) 
   {
-    rclcpp::spin_some(node_);
+    executor.spin_some();
     if (!sync_packages(LidarMeasures)) 
     {
       rate.sleep();
@@ -932,7 +988,8 @@ void LIVMapper::img_cbk(const sensor_msgs::Image::ConstSharedPtr &msg_in)
 
   double img_time_correct = msg_header_time; // last_timestamp_lidar + 0.105;
 
-  if (img_time_correct - last_timestamp_img < 0.02)
+  const double image_interval = temporal_enabled_ ? temporal_image_interval_sec_ : image_interval_sec;
+  if (img_time_correct - last_timestamp_img + 1e-4 < image_interval)
   {
     ROS_WARN("Image need Jumps: %.6f", img_time_correct);
     mtx_buffer.unlock();
@@ -1071,8 +1128,10 @@ bool LIVMapper::sync_packages(LidarMeasureGroup &meas)
       mtx_buffer.unlock();
       sig_buffer.notify_all();
 
-      *(meas.pcl_proc_cur) = *(meas.pcl_proc_next);
-      PointCloudXYZI().swap(*meas.pcl_proc_next);
+      // Every backend must split the remainder again at each image time.
+      // Consuming it wholesale uses returns acquired after this update.
+      temporal_lio::splitPendingScan(*meas.pcl_proc_next, *meas.pcl_proc_cur,
+          (img_capture_time - meas.last_lio_update_time) * 1000.0);
 
       int lid_frame_num = lid_raw_data_buffer.size();
       int max_size = meas.pcl_proc_cur->size() + 24000 * lid_frame_num;

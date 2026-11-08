@@ -15,6 +15,8 @@ which is included as part of this source code package.
 
 #include "voxel_map.h"
 #include "feature.h"
+#include "temporal_lio.h"
+#include <functional>
 #include <opencv2/imgproc/imgproc_c.h>
 #include <pcl/filters/voxel_grid.h>
 #include <set>
@@ -83,8 +85,19 @@ public:
 class VIOManager
 {
 public:
+  // Optional temporal backend: commit image likelihood before making map
+  // references. The legacy frontend posterior is only a linearization aid.
+  std::function<bool()> temporal_commit;
+  temporal_lio::PoseObservation temporal_observation;
+  int temporal_pixels = 0;
+  int invalid_patch_evaluations = 0;
+  bool temporal_joint_reference = false;
+  uint64_t temporal_node_id = UINT64_MAX;
+  std::map<uint64_t, temporal_lio::State> temporal_anchor_states;
+  void synchronizeTemporalMap(const std::vector<temporal_lio::Node>& nodes);
+  void captureTemporalObservation(const MatrixXd& j, const VectorXd& r);
   int grid_size;
-  vk::AbstractCamera *cam;
+  vk::AbstractCamera *cam = nullptr;
   vk::PinholeCamera *pinhole_cam;
   StatesGroup *state;
   StatesGroup *state_propagat;
@@ -108,7 +121,7 @@ public:
 
   double img_point_cov, outlier_threshold, ncc_thre;
   
-  SubSparseMap *visual_submap;
+  SubSparseMap *visual_submap = nullptr;
   std::vector<std::vector<V3D>> rays_with_sample_points;
 
   double compute_jacobian_time, update_ekf_time;
@@ -140,9 +153,9 @@ public:
 
   VIOManager();
   ~VIOManager();
-  void updateStateInverse(cv::Mat img, int level);
-  void updateState(cv::Mat img, int level);
-  void processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
+  bool updateStateInverse(cv::Mat img, int level);
+  bool updateState(cv::Mat img, int level);
+  bool processFrame(cv::Mat &img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &feat_map, double img_time);
   void retrieveFromVisualSparseMap(cv::Mat img, vector<pointWithVar> &pg, const unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &plane_map);
   void generateVisualMapPoints(cv::Mat img, vector<pointWithVar> &pg);
   void setImuToLidarExtrinsic(const V3D &transl, const M3D &rot);
@@ -150,7 +163,7 @@ public:
   void initializeVIO();
   void getImagePatch(cv::Mat img, V2D pc, float *patch_tmp, int level);
   void computeProjectionJacobian(V3D p, MD(2, 3) & J);
-  void computeJacobianAndUpdateEKF(cv::Mat img);
+  bool computeJacobianAndUpdateEKF(cv::Mat img);
   void resetGrid();
   void updateVisualMapPoints(cv::Mat img);
   void getWarpMatrixAffine(const vk::AbstractCamera &cam, const Vector2d &px_ref, const Vector3d &f_ref, const double depth_ref, const SE3 &T_cur_ref,

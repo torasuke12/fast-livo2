@@ -14,13 +14,16 @@ which is included as part of this source code package.
 #define VOXEL_MAP_H_
 
 #include "common_lib.h"
+#include "ikd-Tree/ikd_Tree.h"
+#include "xicp.h"
+#include "lio_diagnostics.h"
+#include "normal_consistency.h"
 #include <Eigen/Dense>
 #include <fstream>
 #include <math.h>
 #include <mutex>
 #include <omp.h>
 #include <pcl/common/io.h>
-#include <pcl/kdtree/kdtree_flann.h>
 #include <rclcpp/rclcpp.hpp>
 #include <string>
 #include <thread>
@@ -31,6 +34,29 @@ which is included as part of this source code package.
 #define VOXELMAP_MAX_N 10000000000
 
 static int voxel_plane_id = 0;
+
+struct VoxelMapInitializationConfig
+{
+  int min_points = 5000;
+  int min_planes = 100;
+  // Smallest eigenvalue of mean(n * n.transpose()), where n is a unit normal.
+  // Opposite normals count as the same direction; the eigenvalues sum to one.
+  double min_normal_eigenvalue = 0.02;
+  double min_duration_sec = 0.1;
+  double max_duration_sec = 2.0;
+  int max_points = 100000;
+};
+
+struct VoxelMapInitializationStatus
+{
+  size_t points = 0;
+  size_t scans = 0;
+  size_t planes = 0;
+  size_t resets = 0;
+  double duration_sec = 0.0;
+  V3D normal_eigenvalues = V3D::Zero();
+  bool ready = false;
+};
 
 typedef struct VoxelMapConfig
 {
@@ -46,14 +72,16 @@ typedef struct VoxelMapConfig
   double max_state_cov_for_matching_;
   int neighbor_voxel_radius_;
   std::string correspondence_mode_;
-  int knn_num_match_points_;
-  double knn_max_neighbor_sq_dist_;
-  double knn_plane_threshold_;
-  double knn_residual_score_threshold_;
-  double knn_map_voxel_size_;
-  double knn_laser_point_cov_;
+  double fastlio_filter_size_map_;
+  double fastlio_cube_side_length_;
+  double fastlio_detection_range_;
   bool gravity_norm_constraint_;
   bool is_pub_plane_map_;
+  VoxelMapInitializationConfig initialization_;
+  fast_livo2::xicp::Config xicp_;
+  fast_livo2::diagnostics::Config diagnostics_;
+  fast_livo2::normal_consistency::Config normal_consistency_;
+  std::string debug_log_dir_;
 
   // config of local map sliding
   double sliding_thresh;
@@ -63,6 +91,7 @@ typedef struct VoxelMapConfig
 
 typedef struct PointToPlane
 {
+  int source_index_ = -1;
   Eigen::Vector3d point_b_;
   Eigen::Vector3d point_w_;
   Eigen::Vector3d normal_;
@@ -226,40 +255,51 @@ public:
   std::vector<M3D> body_cov_list_;
   std::vector<pointWithVar> pv_list_;
   std::vector<PointToPlane> ptpl_list_;
-  std::unordered_map<VOXEL_LOCATION, PointType> knn_map_voxels_;
-  PointCloudXYZI::Ptr knn_map_cloud_;
-  pcl::KdTreeFLANN<PointType>::Ptr knn_kdtree_;
-  std::vector<std::vector<int>> knn_nearest_indices_;
-  std::vector<uint8_t> knn_neighbor_valid_;
+  KD_TREE<PointType> fastlio_ikdtree_;
+  std::vector<PointVector> fastlio_nearest_points_;
+  std::vector<uint8_t> fastlio_neighbor_valid_;
+  BoxPointType fastlio_local_map_points_{};
+  bool fastlio_local_map_initialized_ = false;
 
   VoxelMapManager(VoxelMapConfig &config_setting, std::unordered_map<VOXEL_LOCATION, VoxelOctoTree *> &voxel_map)
-      : config_setting_(config_setting), voxel_map_(voxel_map)
+      : config_setting_(config_setting), voxel_map_(voxel_map),
+        lio_diagnostics_(diagnosticsConfig(config_setting), std::string(ROOT_DIR) + "Log/diagnostics",
+                         [](const std::string &message) {
+                           RCLCPP_WARN(rclcpp::get_logger("laserMapping"), "%s", message.c_str());
+                         })
   {
     current_frame_id_ = 0;
     feats_undistort_.reset(new PointCloudXYZI());
     feats_down_body_.reset(new PointCloudXYZI());
     feats_down_world_.reset(new PointCloudXYZI());
-    knn_map_cloud_.reset(new PointCloudXYZI());
-    knn_kdtree_.reset(new pcl::KdTreeFLANN<PointType>());
   };
 
-  void StateEstimation(StatesGroup &state_propagat);
+  void StateEstimation(StatesGroup &state_propagat, double scan_time = -1.0);
   M3D boundedStateCovarianceBlock(int start_index) const;
   void TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vector3d t, const PointCloudXYZI::Ptr &input_cloud,
                       pcl::PointCloud<pcl::PointXYZI>::Ptr &trans_cloud);
 
   void BuildVoxelMap();
+  // Only voxel-plane uses accumulation. ikd-tree keeps its single-scan seed.
+  // Optional output is populated only on the transition to READY, in world
+  // coordinates. Existing callers retain the same map/gate behavior.
+  bool TryInitializeVoxelMap(double scan_time, std::vector<pointWithVar> *accepted_seed = nullptr);
+  const VoxelMapInitializationStatus &initializationStatus() const { return initialization_status_; }
   V3F RGBFromVoxel(const V3D &input_point);
 
   void UpdateVoxelMap(const std::vector<pointWithVar> &input_points);
-  void UpdateKnnPointMap(const PointCloudXYZI::Ptr &world_cloud);
+  void UpdateFastLioMap(const PointCloudXYZI::Ptr &world_cloud);
+  bool FastLioMapReady() const;
+  // Once per deskewed/downsampled scan; iteration poses are applied at matching time.
+  void PrepareSourceNormals(bool geometry_requested = false);
 
   void BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list);
-  void BuildResidualListKNN(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list,
-                            bool recompute_neighbors);
+  void BuildResidualListFastLio(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list,
+                                bool recompute_neighbors, int iteration = -1);
 
   void build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess, double &prob,
-                             PointToPlane &single_ptpl);
+                             PointToPlane &single_ptpl, fast_livo2::diagnostics::GeometryPoint *record = nullptr,
+                             const VOXEL_LOCATION &root_voxel = VOXEL_LOCATION());
 
   void pubVoxelMap();
 
@@ -267,8 +307,35 @@ public:
   void clearMemOutOfMap(const int& x_max,const int& x_min,const int& y_max,const int& y_min,const int& z_max,const int& z_min );
 
 private:
-  void rebuildKnnIndex();
-  bool estimateKnnPlane(const std::vector<int> &point_indices, V3D &normal, double &d, V3D &center) const;
+  static fast_livo2::diagnostics::Config diagnosticsConfig(const VoxelMapConfig &config)
+  {
+    auto result = config.diagnostics_;
+    result.correspondence_mode = config.correspondence_mode_;
+    return result;
+  }
+  fast_livo2::diagnostics::Logger lio_diagnostics_;
+  std::vector<fast_livo2::diagnostics::GeometryPoint> diagnostic_geometry_;
+  std::vector<fast_livo2::normal_consistency::SourceNormal> source_normals_;
+  fast_livo2::diagnostics::NormalStats normal_stats_;
+  void captureGeometry(int iteration, const StatesGroup &prior,
+                             const StatesGroup &linearization, const StatesGroup &after) noexcept;
+  void logXicp(double scan_time, int iteration, const fast_livo2::xicp::Detection &detection,
+               const fast_livo2::xicp::Update &update, const StatesGroup &propagated,
+               const StatesGroup &before, double elapsed_ms);
+  std::ofstream xicp_log_;
+  bool xicp_log_attempted_ = false;
+  std::vector<pointWithVar> initialMapPoints() const;
+  void buildVoxelMapFromPoints(const std::vector<pointWithVar> &input_points);
+  void resetVoxelInitialization();
+  void reportVoxelInitialization(double scan_time);
+  std::vector<pointWithVar> initialization_points_;
+  VoxelMapInitializationStatus initialization_status_;
+  double initialization_start_time_ = -1.0;
+  double initialization_last_time_ = -1.0;
+  double initialization_log_time_ = -1.0;
+  void BuildFastLioMap();
+  void SegmentFastLioLocalMap();
+  bool estimateFastLioPlane(const PointVector &points, V3D &normal, double &d, V3D &center) const;
   void constrainGravityState(bool project_covariance);
   void GetUpdatePlane(const VoxelOctoTree *current_octo, const int pub_max_voxel_layer, std::vector<VoxelPlane> &plane_list);
 

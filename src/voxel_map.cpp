@@ -11,12 +11,22 @@ which is included as part of this source code package.
 */
 
 #include "voxel_map.h"
+#include "point_uncertainty.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cstdlib>
+#include <stdexcept>
 
 namespace
 {
+constexpr int kFastLioNumMatchPoints = 5;
+constexpr double kFastLioMaxNeighborSquaredDistance = 5.0;
+constexpr double kFastLioPlaneThreshold = 0.1;
+constexpr double kFastLioResidualScoreThreshold = 0.9;
+constexpr double kFastLioLaserPointCovariance = 0.001;
+constexpr double kFastLioMoveThreshold = 1.5;
+
 VOXEL_LOCATION worldToVoxelLocation(const Eigen::Vector3d &point, const double voxel_size)
 {
   return VOXEL_LOCATION(static_cast<int64_t>(std::floor(point.x() / voxel_size)),
@@ -81,26 +91,87 @@ void loadVoxelConfig(const rclcpp::Node::SharedPtr &node, VoxelMapConfig &voxel_
   if (voxel_config.max_state_cov_for_matching_ <= 0.0) voxel_config.max_state_cov_for_matching_ = 0.01;
   voxel_config.neighbor_voxel_radius_ = fast_livo2::declareOrGet<int>(node, "lio/neighbor_voxel_radius", 1);
   if (voxel_config.neighbor_voxel_radius_ < 0) voxel_config.neighbor_voxel_radius_ = 0;
-  voxel_config.correspondence_mode_ = fast_livo2::declareOrGet<std::string>(node, "lio/correspondence_mode", "fastlio_knn");
-  if (voxel_config.correspondence_mode_ != "fastlio_knn" && voxel_config.correspondence_mode_ != "voxel_plane")
+  voxel_config.correspondence_mode_ =
+      fast_livo2::declareOrGet<std::string>(node, "lio/correspondence_mode", "fastlio_ikdtree");
+  if (voxel_config.correspondence_mode_ == "fastlio_knn")
   {
-    RCLCPP_WARN(node->get_logger(), "Unknown lio/correspondence_mode '%s'; using fastlio_knn",
-                voxel_config.correspondence_mode_.c_str());
-    voxel_config.correspondence_mode_ = "fastlio_knn";
+    RCLCPP_WARN(node->get_logger(),
+                "lio/correspondence_mode=fastlio_knn is deprecated; using the FAST-LIO incremental ikd-tree");
+    voxel_config.correspondence_mode_ = "fastlio_ikdtree";
   }
-  voxel_config.knn_num_match_points_ = fast_livo2::declareOrGet<int>(node, "lio/knn_num_match_points", 5);
-  if (voxel_config.knn_num_match_points_ < 3) voxel_config.knn_num_match_points_ = 5;
-  voxel_config.knn_max_neighbor_sq_dist_ = fast_livo2::declareOrGet<double>(node, "lio/knn_max_neighbor_sq_dist", 5.0);
-  if (voxel_config.knn_max_neighbor_sq_dist_ <= 0.0) voxel_config.knn_max_neighbor_sq_dist_ = 5.0;
-  voxel_config.knn_plane_threshold_ = fast_livo2::declareOrGet<double>(node, "lio/knn_plane_threshold", 0.1);
-  if (voxel_config.knn_plane_threshold_ <= 0.0) voxel_config.knn_plane_threshold_ = 0.1;
-  voxel_config.knn_residual_score_threshold_ = fast_livo2::declareOrGet<double>(node, "lio/knn_residual_score_threshold", 0.9);
-  voxel_config.knn_map_voxel_size_ = fast_livo2::declareOrGet<double>(node, "lio/knn_map_voxel_size", 0.5);
-  if (voxel_config.knn_map_voxel_size_ <= 0.0) voxel_config.knn_map_voxel_size_ = 0.5;
-  voxel_config.knn_laser_point_cov_ = fast_livo2::declareOrGet<double>(node, "lio/knn_laser_point_cov", 0.001);
-  if (voxel_config.knn_laser_point_cov_ <= 0.0) voxel_config.knn_laser_point_cov_ = 0.001;
+  if (voxel_config.correspondence_mode_ != "fastlio_ikdtree" && voxel_config.correspondence_mode_ != "voxel_plane")
+  {
+    RCLCPP_WARN(node->get_logger(), "Unknown lio/correspondence_mode '%s'; using fastlio_ikdtree",
+                voxel_config.correspondence_mode_.c_str());
+    voxel_config.correspondence_mode_ = "fastlio_ikdtree";
+  }
+  voxel_config.fastlio_filter_size_map_ =
+      fast_livo2::declareOrGet<double>(node, "lio/fastlio_filter_size_map", 0.5);
+  if (voxel_config.fastlio_filter_size_map_ <= 0.0) voxel_config.fastlio_filter_size_map_ = 0.5;
+  voxel_config.fastlio_cube_side_length_ =
+      fast_livo2::declareOrGet<double>(node, "lio/fastlio_cube_side_length", 1000.0);
+  if (voxel_config.fastlio_cube_side_length_ <= 0.0) voxel_config.fastlio_cube_side_length_ = 1000.0;
+  voxel_config.fastlio_detection_range_ =
+      fast_livo2::declareOrGet<double>(node, "lio/fastlio_detection_range", 100.0);
+  if (voxel_config.fastlio_detection_range_ <= 0.0) voxel_config.fastlio_detection_range_ = 100.0;
   voxel_config.gravity_norm_constraint_ =
       fast_livo2::declareOrGet<bool>(node, "lio/gravity_norm_constraint", true);
+  voxel_config.debug_log_dir_ = fast_livo2::declareOrGet<std::string>(node, "debug/log_dir", "");
+  auto &normal = voxel_config.normal_consistency_;
+  normal.enabled = fast_livo2::declareOrGet<bool>(node, "lio/normal_consistency/enabled", false);
+  normal.neighbors = fast_livo2::declareOrGet<int>(node, "lio/normal_consistency/neighbors", 20);
+  normal.max_neighbor_distance = fast_livo2::declareOrGet<double>(node, "lio/normal_consistency/max_neighbor_distance", 1.0);
+  normal.max_planarity_ratio = fast_livo2::declareOrGet<double>(node, "lio/normal_consistency/max_planarity_ratio", 0.1);
+  normal.min_spread_ratio = fast_livo2::declareOrGet<double>(node, "lio/normal_consistency/min_spread_ratio", 0.1);
+  normal.max_angle_deg = fast_livo2::declareOrGet<double>(node, "lio/normal_consistency/max_angle_deg", 30.0);
+  normal.validate();
+  if (normal.enabled && voxel_config.correspondence_mode_ != "fastlio_ikdtree")
+    throw std::invalid_argument("lio.normal_consistency supports fastlio_ikdtree/fastlio_knn only");
+  RCLCPP_INFO(node->get_logger(), "Source/map normal gate: %s (%.1f deg, %d source neighbors)",
+              normal.enabled ? "enabled" : "disabled", normal.max_angle_deg, normal.neighbors);
+  auto &xicp = voxel_config.xicp_;
+  xicp.enabled = fast_livo2::declareOrGet<bool>(node, "lio/xicp/enabled", false);
+  xicp.diagnostics = fast_livo2::declareOrGet<bool>(node, "lio/xicp/diagnostics", false);
+  xicp.contribution_min = fast_livo2::declareOrGet<double>(node, "lio/xicp/contribution_min", xicp.contribution_min);
+  xicp.contribution_strong = fast_livo2::declareOrGet<double>(node, "lio/xicp/contribution_strong", xicp.contribution_strong);
+  xicp.enough_information = fast_livo2::declareOrGet<double>(node, "lio/xicp/enough_information", xicp.enough_information);
+  xicp.insufficient_information = fast_livo2::declareOrGet<double>(node, "lio/xicp/insufficient_information", xicp.insufficient_information);
+  xicp.minimal_information = fast_livo2::declareOrGet<double>(node, "lio/xicp/minimal_information", xicp.minimal_information);
+  xicp.rank_relative_tolerance = fast_livo2::declareOrGet<double>(node, "lio/xicp/rank_relative_tolerance", xicp.rank_relative_tolerance);
+  xicp.validate();
+  RCLCPP_INFO(node->get_logger(), "X-ICP constrained LIO update: %s (diagnostics %s)",
+              xicp.enabled ? "enabled" : "disabled", xicp.diagnostics ? "enabled" : "disabled");
+  auto &diagnostics = voxel_config.diagnostics_;
+  diagnostics.enabled = fast_livo2::declareOrGet<bool>(node, "lio/diagnostics/enabled", false);
+  diagnostics.output_dir = fast_livo2::declareOrGet<std::string>(node, "lio/diagnostics/output_dir", "");
+  diagnostics.detail_enabled = fast_livo2::declareOrGet<bool>(node, "lio/diagnostics/detail/enabled", false);
+  diagnostics.detail_final_only = fast_livo2::declareOrGet<bool>(node, "lio/diagnostics/detail/final_only", false);
+  diagnostics.geometry_enabled = fast_livo2::declareOrGet<bool>(node, "lio/diagnostics/geometry/enabled", false);
+  diagnostics.detail_start_sec = fast_livo2::declareOrGet<double>(node, "lio/diagnostics/detail/start_sec", 170.0);
+  diagnostics.detail_end_sec = fast_livo2::declareOrGet<double>(node, "lio/diagnostics/detail/end_sec", 220.0);
+  diagnostics.xicp_enabled = xicp.enabled;
+  diagnostics.validate();
+  diagnostics.correspondence_mode = voxel_config.correspondence_mode_;
+  auto &initialization = voxel_config.initialization_;
+  initialization.min_points = fast_livo2::declareOrGet<int>(node, "lio/voxel_init_min_points", 5000);
+  initialization.min_planes = fast_livo2::declareOrGet<int>(node, "lio/voxel_init_min_planes", 100);
+  initialization.min_normal_eigenvalue =
+      fast_livo2::declareOrGet<double>(node, "lio/voxel_init_min_normal_eigenvalue", 0.02);
+  initialization.min_duration_sec = fast_livo2::declareOrGet<double>(node, "lio/voxel_init_min_duration_sec", 0.1);
+  initialization.max_duration_sec = fast_livo2::declareOrGet<double>(node, "lio/voxel_init_max_duration_sec", 2.0);
+  initialization.max_points = fast_livo2::declareOrGet<int>(node, "lio/voxel_init_max_points", 100000);
+  if (voxel_config.correspondence_mode_ == "voxel_plane" &&
+      (initialization.min_points < 6 || initialization.min_planes < 3 ||
+      initialization.max_points < initialization.min_points ||
+      !std::isfinite(initialization.min_normal_eigenvalue) || initialization.min_normal_eigenvalue <= 0.0 ||
+      initialization.min_normal_eigenvalue >= 1.0 / 3.0 ||
+      !std::isfinite(initialization.min_duration_sec) || initialization.min_duration_sec < 0.0 ||
+      !std::isfinite(initialization.max_duration_sec) || initialization.max_duration_sec <= initialization.min_duration_sec))
+  {
+    throw std::invalid_argument("Invalid lio.voxel_init_* thresholds: require points >= 6, planes >= 3, "
+                                "max_points >= min_points, 0 < normal eigenvalue < 1/3, "
+                                "and 0 <= min_duration < max_duration");
+  }
   RCLCPP_INFO(node->get_logger(), "LIO correspondence mode: %s", voxel_config.correspondence_mode_.c_str());
   voxel_config.beam_err_ = fast_livo2::declareOrGet<double>(node, "lio/beam_err", 0.02);
   voxel_config.dept_err_ = fast_livo2::declareOrGet<double>(node, "lio/dept_err", 0.05);
@@ -117,6 +188,14 @@ void loadVoxelConfig(const rclcpp::Node::SharedPtr &node, VoxelMapConfig &voxel_
   voxel_config.map_sliding_en = fast_livo2::declareOrGet<bool>(node, "local_map/map_sliding_en", false);
   voxel_config.half_map_size = fast_livo2::declareOrGet<int>(node, "local_map/half_map_size", 100);
   voxel_config.sliding_thresh = fast_livo2::declareOrGet<double>(node, "local_map/sliding_thresh", 8.0);
+  if (diagnostics.enabled)
+  {
+    for (const auto &name : node->list_parameters({}, 0).names)
+      diagnostics.parameters.emplace(name, node->get_parameter(name).value_to_string());
+    RCLCPP_INFO(node->get_logger(), "LIO diagnostics enabled (detail %s, [%.3f, %.3f) s)",
+                diagnostics.detail_enabled ? "enabled" : "disabled",
+                diagnostics.detail_start_sec, diagnostics.detail_end_sec);
+  }
 }
 
 void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPlane *plane)
@@ -142,7 +221,22 @@ void VoxelOctoTree::init_plane(const std::vector<pointWithVar> &points, VoxelPla
   Eigen::Matrix3f::Index evalsMin, evalsMax;
   evalsReal.rowwise().sum().minCoeff(&evalsMin);
   evalsReal.rowwise().sum().maxCoeff(&evalsMax);
+  // Accumulating static scans can produce coincident/collinear samples. They
+  // do not define a plane: avoid an invalid middle index or zero eigen-gap in
+  // the normal-covariance Jacobian below.
+  if (!evalsReal.allFinite() || evalsMin == evalsMax)
+  {
+    plane->is_plane_ = false;
+    plane->is_update_ = true;
+    return;
+  }
   int evalsMid = 3 - evalsMin - evalsMax;
+  if (evalsReal(evalsMid) - evalsReal(evalsMin) <= 1e-9)
+  {
+    plane->is_plane_ = false;
+    plane->is_update_ = true;
+    return;
+  }
   Eigen::Vector3d evecMin = evecs.real().col(evalsMin);
   Eigen::Vector3d evecMid = evecs.real().col(evalsMid);
   Eigen::Vector3d evecMax = evecs.real().col(evalsMax);
@@ -402,8 +496,47 @@ VoxelOctoTree *VoxelOctoTree::Insert(const pointWithVar &pv)
   return nullptr;
 }
 
-void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
+void VoxelMapManager::PrepareSourceNormals(bool geometry_requested)
 {
+  source_normals_.clear();
+  normal_stats_ = {};
+  if (config_setting_.correspondence_mode_ != "fastlio_ikdtree" ||
+      (!config_setting_.normal_consistency_.enabled && !geometry_requested)) return;
+  const auto start = std::chrono::steady_clock::now();
+  try
+  {
+    source_normals_ = fast_livo2::normal_consistency::estimate(*feats_down_body_, config_setting_.normal_consistency_);
+  }
+  catch (const std::exception &error)
+  {
+    if (config_setting_.normal_consistency_.enabled) throw;
+    // Optional geometry diagnostics must not turn a logging failure into a filter failure.
+    lio_diagnostics_.disable(error.what());
+    return;
+  }
+  for (const auto &source : source_normals_)
+    source.usable() ? ++normal_stats_.valid : ++normal_stats_.invalid;
+  normal_stats_.computation_ms = std::chrono::duration<double, std::milli>(
+      std::chrono::steady_clock::now() - start).count();
+}
+
+void VoxelMapManager::StateEstimation(StatesGroup &state_propagat, const double scan_time)
+{
+  using DiagnosticStatus = fast_livo2::diagnostics::ScanStatus;
+  DiagnosticStatus diagnostic_status = DiagnosticStatus::NoUpdate;
+  int diagnostic_last_iteration = -2;
+  if (lio_diagnostics_.enabled()) lio_diagnostics_.beginScan(scan_time, state_propagat.cov);
+  if (config_setting_.correspondence_mode_ == "fastlio_ikdtree")
+  {
+    if (fastlio_ikdtree_.Root_Node == nullptr)
+    {
+      effct_feat_num_ = 0;
+      if (lio_diagnostics_.enabled()) lio_diagnostics_.endScan(DiagnosticStatus::NoMap, -2, state_.cov);
+      return;
+    }
+    SegmentFastLioLocalMap();
+  }
+
   cross_mat_list_.clear();
   cross_mat_list_.reserve(feats_down_size_);
   body_cov_list_.clear();
@@ -435,38 +568,59 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
   H_T_H.setZero();
   I_STATE.setIdentity();
 
-  bool flg_EKF_inited, flg_EKF_converged, EKF_stop_flg = 0;
-  bool recompute_knn_neighbors = true;
+  bool flg_EKF_converged, EKF_stop_flg = 0;
+  bool recompute_fastlio_neighbors = true;
   const MD(DIM_STATE, DIM_STATE) propagated_covariance = state_propagat.cov;
-  knn_nearest_indices_.assign(feats_down_size_, {});
-  knn_neighbor_valid_.assign(feats_down_size_, 0);
+  fastlio_nearest_points_.assign(feats_down_size_, {});
+  fastlio_neighbor_valid_.assign(feats_down_size_, 0);
+  diagnostic_geometry_.clear();
+  if (lio_diagnostics_.geometryEnabled())
+  {
+    try { diagnostic_geometry_.resize(feats_down_size_); }
+    catch (const std::exception &error) { lio_diagnostics_.disable(error.what()); }
+    catch (...) { lio_diagnostics_.disable("geometry allocation failed"); }
+  }
+  PrepareSourceNormals(lio_diagnostics_.geometryEnabled());
   // FAST-LIO's IKFoM update loops from -1 through max_iterations - 1.
   for (int iterCount = -1; iterCount < config_setting_.max_iterations_; iterCount++)
   {
+    diagnostic_last_iteration = iterCount;
     double total_residual = 0.0;
     pcl::PointCloud<pcl::PointXYZI>::Ptr world_lidar(new pcl::PointCloud<pcl::PointXYZI>);
     TransformLidar(state_.rot_end, state_.pos_end, feats_down_body_, world_lidar);
-    const M3D rot_var = boundedStateCovarianceBlock(0);
-    const M3D t_var = boundedStateCovarianceBlock(3);
+    const auto pose_cov=fast_livo2::boundedPoseCovariance(state_.cov.topLeftCorner<6,6>(),
+        config_setting_.max_state_cov_for_matching_);
     for (size_t i = 0; i < feats_down_body_->size(); i++)
     {
       pointWithVar &pv = pv_list_[i];
       pv.point_b << feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z;
       pv.point_w << world_lidar->points[i].x, world_lidar->points[i].y, world_lidar->points[i].z;
 
-      M3D cov = body_cov_list_[i];
-      M3D point_crossmat = cross_mat_list_[i];
-      cov = state_.rot_end * cov * state_.rot_end.transpose() + (-point_crossmat) * rot_var * (-point_crossmat.transpose()) + t_var;
+      const M3D cov=fast_livo2::worldPointCovariance(extR_*pv.point_b+extT_,state_.rot_end,extR_,
+          body_cov_list_[i],pose_cov);
       pv.var = cov;
       pv.body_var = body_cov_list_[i];
+      if (lio_diagnostics_.geometryEnabled())
+      {
+        auto &point = diagnostic_geometry_[i];
+        if (config_setting_.correspondence_mode_ == "voxel_plane") point = {};
+        point.lidar = pv.point_b;
+        point.world = pv.point_w;
+        point.match_index = -1;
+        point.status = fast_livo2::diagnostics::MatchStatus::InvalidPoint;
+        point.normal.setZero(); point.center.setZero();
+        point.plane_d = 0.0; point.distance = 0.0;
+        point.source = source_normals_.empty() ? fast_livo2::normal_consistency::SourceNormal{} : source_normals_[i];
+        point.comparison = {};
+      }
     }
     ptpl_list_.clear();
 
     // double t1 = omp_get_wtime();
 
-    if (config_setting_.correspondence_mode_ == "fastlio_knn")
+    if (config_setting_.correspondence_mode_ == "fastlio_ikdtree")
     {
-      BuildResidualListKNN(pv_list_, ptpl_list_, recompute_knn_neighbors);
+      BuildResidualListFastLio(pv_list_, ptpl_list_, recompute_fastlio_neighbors, iterCount);
     }
     else
     {
@@ -483,7 +637,16 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     cout << "[ LIO ] Raw feature num: " << feats_undistort_->size() << ", downsampled feature num:" << feats_down_size_ 
          << " effective feature num: " << effct_feat_num_ << " average residual: "
          << (effct_feat_num_ > 0 ? total_residual / effct_feat_num_ : 0.0) << endl;
-    if (effct_feat_num_ < 1) break;
+    if (effct_feat_num_ < 1)
+    {
+      // An empty rematch must not retain an earlier iteration's uncommitted
+      // correction with the propagated covariance.
+      const StatesGroup diagnostic_before = state_;
+      state_ = state_propagat;
+      captureGeometry(iterCount, state_propagat, diagnostic_before, state_);
+      diagnostic_status = DiagnosticStatus::NoMatches;
+      break;
+    }
 
     /*** Computation of Measuremnt Jacobian matrix H and measurents covarience
      * ***/
@@ -527,14 +690,21 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
       double sigma_l = J_nq * ptpl_list_[i].plane_var_ * J_nq.transpose();
 
-      if (config_setting_.correspondence_mode_ == "fastlio_knn")
+      if (config_setting_.correspondence_mode_ == "fastlio_ikdtree")
       {
-        // FAST-LIO uses a constant LASER_POINT_COV for all accepted point-to-plane residuals.
-        R_inv(i) = 1.0 / config_setting_.knn_laser_point_cov_;
+        // FAST-LIO uses the fixed LASER_POINT_COV=0.001 for accepted residuals.
+        R_inv(i) = 1.0 / kFastLioLaserPointCovariance;
       }
       else
       {
         R_inv(i) = 1.0 / (0.001 + sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
+        if (lio_diagnostics_.geometryEnabled())
+        {
+          auto &record = diagnostic_geometry_[ptpl.source_index_].voxel;
+          record.update_plane_variance = sigma_l;
+          record.update_point_variance = ptpl.normal_.dot(var * ptpl.normal_);
+          record.update_variance = 1.0 / R_inv(i);
+        }
       }
       // R_inv(i) = 1.0 / (sigma_l + ptpl_list_[i].normal_.transpose() * var * ptpl_list_[i].normal_);
 
@@ -573,10 +743,6 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       iteration_covariance.block<3, 3>(16, 16) += gravity_unit * gravity_unit.transpose() * 1e-8;
     }
     iteration_covariance = 0.5 * (iteration_covariance + iteration_covariance.transpose());
-    // EigenSolver<Matrix<double, 6, 6>> es(H_T_H.block<6,6>(0,0));
-    MD(DIM_STATE, DIM_STATE) &&K_1 =
-        (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + iteration_covariance.inverse()).inverse();
-    G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
     auto vec = state_propagat - state_;
     vec.block<3, 1>(0, 0) =
         -propagated_to_current.block<3, 3>(0, 0) * propagated_to_current_delta.block<3, 1>(0, 0);
@@ -586,9 +752,54 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       vec.block<3, 1>(16, 0) =
           (M3D::Identity() - gravity_unit * gravity_unit.transpose()) * (state_propagat.gravity - state_.gravity);
     }
-    VD(DIM_STATE)
-    solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
-    int minRow, minCol;
+    VD(DIM_STATE) solution;
+    fast_livo2::xicp::Detection xicp_detection;
+    fast_livo2::xicp::Update xicp_update;
+    MatrixXd diagnostic_baseline_gain;
+    const StatesGroup before_update = state_;
+    const double xicp_start = omp_get_wtime();
+    if (config_setting_.xicp_.enabled)
+    {
+      try
+      {
+        MatrixXd local_points(effct_feat_num_, 3), local_normals(effct_feat_num_, 3);
+        const M3D lidar_from_world = (state_.rot_end * extR_).transpose();
+        for (int i = 0; i < effct_feat_num_; ++i)
+        {
+          local_points.row(i) = ptpl_list_[i].point_b_.transpose();
+          local_normals.row(i) = (lidar_from_world * ptpl_list_[i].normal_).transpose();
+        }
+        xicp_detection = fast_livo2::xicp::detect(local_points, local_normals, config_setting_.xicp_);
+        const MatrixXd local_pose = fast_livo2::xicp::localPoseJacobian(state_.rot_end, extR_, extT_, DIM_STATE);
+        xicp_update = fast_livo2::xicp::update(iteration_covariance, Hsub, R_inv, meas_vec, vec,
+                                             xicp_detection.constraints * local_pose, xicp_detection.target_gain);
+        solution = xicp_update.correction;
+      }
+      catch (const std::exception &error)
+      {
+        // Never fall back to an unconstrained update on a numerical failure.
+        // Reject this scan's correction, keeping its original IMU prediction.
+        RCLCPP_ERROR(rclcpp::get_logger("laserMapping"), "X-ICP rejected LIO update at %.6f: %s", scan_time, error.what());
+        state_ = state_propagat;
+        captureGeometry(iterCount, state_propagat, before_update, state_);
+        if (lio_diagnostics_.enabled()) lio_diagnostics_.endScan(DiagnosticStatus::Rejected, iterCount, state_.cov);
+        return;
+      }
+    }
+    else
+    {
+      // Preserve the pre-X-ICP update path for controlled A/B replay.
+      MD(DIM_STATE, DIM_STATE) &&K_1 =
+          (H_T_H.block<DIM_STATE, DIM_STATE>(0, 0) + iteration_covariance.inverse()).inverse();
+      G.block<DIM_STATE, 6>(0, 0) = K_1.block<DIM_STATE, 6>(0, 0) * H_T_H.block<6, 6>(0, 0);
+      solution = K_1.block<DIM_STATE, 6>(0, 0) * HTz + vec.block<DIM_STATE, 1>(0, 0) - G.block<DIM_STATE, 6>(0, 0) * vec.block<6, 1>(0, 0);
+      if (lio_diagnostics_.enabled())
+      {
+        try { diagnostic_baseline_gain = K_1.block<DIM_STATE, 6>(0, 0) * Hsub_T_R_inv; }
+        catch (const std::exception &error) { lio_diagnostics_.disable(error.what()); }
+        catch (...) { lio_diagnostics_.disable("gain extraction failed"); }
+      }
+    }
     if (config_setting_.gravity_norm_constraint_ && state_.gravity.norm() > 1e-9)
     {
       // FAST-LIO represents gravity on S2. Remove the unobservable radial
@@ -601,6 +812,9 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
     const V3D gravity_before_update = state_.gravity;
     state_ += solution;
     constrainGravityState(false);
+    if (config_setting_.xicp_.enabled && config_setting_.xicp_.diagnostics)
+      logXicp(scan_time, iterCount, xicp_detection, xicp_update, state_propagat, before_update,
+              (omp_get_wtime() - xicp_start) * 1000.0);
     // FAST-LIO declares convergence only when every error-state component is
     // within 0.001. This also controls when nearest neighbors are searched again.
     flg_EKF_converged = (solution.array().abs() <= 0.001).all();
@@ -610,8 +824,8 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
     const bool force_final_rematch =
         (rematch_num == 0) && (iterCount == (config_setting_.max_iterations_ - 2));
-    recompute_knn_neighbors = flg_EKF_converged || force_final_rematch;
-    if (recompute_knn_neighbors) { rematch_num++; }
+    recompute_fastlio_neighbors = flg_EKF_converged || force_final_rematch;
+    if (recompute_fastlio_neighbors) { rematch_num++; }
 
     /*** Convergence Judgements and Covariance Update ***/
     if (!EKF_stop_flg && (rematch_num >= 2 || (iterCount == config_setting_.max_iterations_ - 1)))
@@ -624,9 +838,12 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       {
         update_transport.block<3, 3>(16, 16) = gravityTangentTransport(gravity_before_update, state_.gravity);
       }
-      state_.cov = update_transport *
-                   (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) *
-                   iteration_covariance * update_transport.transpose();
+      if (config_setting_.xicp_.enabled)
+        state_.cov = update_transport * xicp_update.covariance * update_transport.transpose();
+      else
+        state_.cov = update_transport *
+                     (I_STATE.block<DIM_STATE, DIM_STATE>(0, 0) - G.block<DIM_STATE, DIM_STATE>(0, 0)) *
+                     iteration_covariance * update_transport.transpose();
       state_.cov = 0.5 * (state_.cov + state_.cov.transpose());
       constrainGravityState(true);
       // total_distance += (_state.pos_end - position_last).norm();
@@ -636,9 +853,31 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
       // VD(DIM_STATE) K_sum  = K.rowwise().sum();
       // VD(DIM_STATE) P_diag = _state.cov.diagonal();
       EKF_stop_flg = true;
+      diagnostic_status = DiagnosticStatus::Updated;
+    }
+    if (lio_diagnostics_.enabled())
+    {
+      try
+      {
+        MatrixXd constraints(0, DIM_STATE), target_gain(0, effct_feat_num_);
+        if (config_setting_.xicp_.enabled)
+        {
+          constraints = xicp_detection.constraints *
+              fast_livo2::xicp::localPoseJacobian(before_update.rot_end, extR_, extT_, DIM_STATE);
+          target_gain = xicp_detection.target_gain;
+        }
+        lio_diagnostics_.iteration(iterCount, EKF_stop_flg, Hsub, R_inv, meas_vec, vec, solution,
+                                   iteration_covariance,
+                                   config_setting_.xicp_.enabled ? xicp_update.gain : diagnostic_baseline_gain,
+                                   constraints, target_gain, xicp_update.constraint_error);
+        if (EKF_stop_flg) captureGeometry(iterCount, state_propagat, before_update, state_);
+      }
+      catch (const std::exception &error) { lio_diagnostics_.disable(error.what()); }
+      catch (...) { lio_diagnostics_.disable("iteration capture failed"); }
     }
     if (EKF_stop_flg) break;
   }
+  if (lio_diagnostics_.enabled()) lio_diagnostics_.endScan(diagnostic_status, diagnostic_last_iteration, state_.cov);
 
   // double t2 = omp_get_wtime();
   // scan_count++;
@@ -649,6 +888,35 @@ void VoxelMapManager::StateEstimation(StatesGroup &state_propagat)
 
   // cout << "[ Mapping ] ekf_time: " << ekf_time << "s, build_residual_time: " << build_residual_time << "s" << endl;
   // cout << "[ Mapping ] ave_ekf_time: " << ave_ekf_time << "s, ave_build_residual_time: " << ave_build_residual_time << "s" << endl;
+}
+
+void VoxelMapManager::captureGeometry(int iteration, const StatesGroup &prior,
+                                            const StatesGroup &linearization, const StatesGroup &after) noexcept
+{
+  if (!lio_diagnostics_.geometryEnabled()) return;
+  try
+  {
+    const auto convert = [](const StatesGroup &state) {
+      fast_livo2::diagnostics::GeometryState result;
+      result.rotation = state.rot_end; result.position = state.pos_end; result.velocity = state.vel_end;
+      result.bg = state.bias_g; result.ba = state.bias_a; result.gravity = state.gravity;
+      result.inverse_exposure = state.inv_expo_time;
+      return result;
+    };
+    if (config_setting_.correspondence_mode_ == "fastlio_ikdtree")
+    for (size_t i = 0; i < diagnostic_geometry_.size(); ++i)
+    {
+      auto &point = diagnostic_geometry_[i];
+      const auto &neighbors = fastlio_nearest_points_[i];
+      point.neighbor_count = static_cast<int>(neighbors.size());
+      for (int j = 0; j < std::min(point.neighbor_count, 5); ++j)
+        point.neighbors[j] = V3D(neighbors[j].x, neighbors[j].y, neighbors[j].z);
+    }
+    lio_diagnostics_.geometry(iteration, convert(prior), convert(linearization), convert(after),
+                              extR_, extT_, diagnostic_geometry_);
+  }
+  catch (const std::exception &error) { lio_diagnostics_.disable(error.what()); }
+  catch (...) { lio_diagnostics_.disable("geometry preparation failed"); }
 }
 
 void VoxelMapManager::constrainGravityState(const bool project_covariance)
@@ -707,15 +975,16 @@ void VoxelMapManager::TransformLidar(const Eigen::Matrix3d rot, const Eigen::Vec
 
 void VoxelMapManager::BuildVoxelMap()
 {
-  float voxel_size = config_setting_.max_voxel_size_;
-  float planer_threshold = config_setting_.planner_threshold_;
-  int max_layer = config_setting_.max_layer_;
-  int max_points_num = config_setting_.max_points_num_;
-  std::vector<int> layer_init_num = config_setting_.layer_init_num_;
+  buildVoxelMapFromPoints(initialMapPoints());
+  BuildFastLioMap();
+}
 
+std::vector<pointWithVar> VoxelMapManager::initialMapPoints() const
+{
   std::vector<pointWithVar> input_points;
-  const M3D rot_var = boundedStateCovarianceBlock(0);
-  const M3D t_var = boundedStateCovarianceBlock(3);
+  input_points.reserve(feats_down_world_->size());
+  const auto pose_cov=fast_livo2::boundedPoseCovariance(state_.cov.topLeftCorner<6,6>(),
+      config_setting_.max_state_cov_for_matching_);
 
   for (size_t i = 0; i < feats_down_world_->size(); i++)
   {
@@ -724,14 +993,20 @@ void VoxelMapManager::BuildVoxelMap()
     V3D point_this(feats_down_body_->points[i].x, feats_down_body_->points[i].y, feats_down_body_->points[i].z);
     M3D var;
     calcBodyCov(point_this, config_setting_.dept_err_, config_setting_.beam_err_, var);
-    M3D point_crossmat;
-    point_crossmat << SKEW_SYM_MATRX(point_this);
-    var = (state_.rot_end * extR_) * var * (state_.rot_end * extR_).transpose() +
-          (-point_crossmat) * rot_var * (-point_crossmat).transpose() + t_var;
+    var=fast_livo2::worldPointCovariance(extR_*point_this+extT_,state_.rot_end,extR_,var,pose_cov);
     pv.var = var;
     input_points.push_back(pv);
   }
+  return input_points;
+}
 
+void VoxelMapManager::buildVoxelMapFromPoints(const std::vector<pointWithVar> &input_points)
+{
+  const float voxel_size = config_setting_.max_voxel_size_;
+  const float planer_threshold = config_setting_.planner_threshold_;
+  const int max_layer = config_setting_.max_layer_;
+  const int max_points_num = config_setting_.max_points_num_;
+  const auto &layer_init_num = config_setting_.layer_init_num_;
   uint plsize = input_points.size();
   for (uint i = 0; i < plsize; i++)
   {
@@ -760,8 +1035,6 @@ void VoxelMapManager::BuildVoxelMap()
   {
     iter->second->init_octo_tree();
   }
-
-  UpdateKnnPointMap(feats_down_world_);
 }
 
 V3F VoxelMapManager::RGBFromVoxel(const V3D &input_point)
@@ -802,101 +1075,204 @@ void VoxelMapManager::UpdateVoxelMap(const std::vector<pointWithVar> &input_poin
   }
 }
 
-void VoxelMapManager::UpdateKnnPointMap(const PointCloudXYZI::Ptr &world_cloud)
+bool VoxelMapManager::FastLioMapReady() const
 {
-  if (config_setting_.correspondence_mode_ != "fastlio_knn" || world_cloud == nullptr || world_cloud->empty()) return;
+  return config_setting_.correspondence_mode_ == "fastlio_ikdtree" && fastlio_ikdtree_.Root_Node != nullptr;
+}
 
-  const double voxel_size = config_setting_.knn_map_voxel_size_;
-  for (const auto &point : world_cloud->points)
+void VoxelMapManager::BuildFastLioMap()
+{
+  if (config_setting_.correspondence_mode_ != "fastlio_ikdtree" ||
+      feats_down_world_ == nullptr || feats_down_world_->empty() || fastlio_ikdtree_.Root_Node != nullptr)
   {
+    return;
+  }
+
+  PointVector initial_points;
+  initial_points.reserve(feats_down_world_->size());
+  for (const auto &point : feats_down_world_->points)
+  {
+    if (std::isfinite(point.x) && std::isfinite(point.y) && std::isfinite(point.z)) initial_points.push_back(point);
+  }
+  if (initial_points.size() <= static_cast<size_t>(kFastLioNumMatchPoints)) return;
+
+  fastlio_ikdtree_.set_downsample_param(static_cast<float>(config_setting_.fastlio_filter_size_map_));
+  fastlio_ikdtree_.Build(initial_points);
+  SegmentFastLioLocalMap();
+  std::cout << "[ LIO ] Initialized FAST-LIO ikd-tree with " << fastlio_ikdtree_.validnum() << " points" << std::endl;
+}
+
+void VoxelMapManager::SegmentFastLioLocalMap()
+{
+  const V3D lidar_position = state_.pos_end + state_.rot_end * extT_;
+  const double cube_side_length = config_setting_.fastlio_cube_side_length_;
+  const double detection_range = config_setting_.fastlio_detection_range_;
+
+  if (!fastlio_local_map_initialized_)
+  {
+    for (int axis = 0; axis < 3; ++axis)
+    {
+      fastlio_local_map_points_.vertex_min[axis] = static_cast<float>(lidar_position(axis) - cube_side_length * 0.5);
+      fastlio_local_map_points_.vertex_max[axis] = static_cast<float>(lidar_position(axis) + cube_side_length * 0.5);
+    }
+    fastlio_local_map_initialized_ = true;
+    return;
+  }
+
+  double distance_to_edge[3][2];
+  bool move_required = false;
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    distance_to_edge[axis][0] = std::abs(lidar_position(axis) - fastlio_local_map_points_.vertex_min[axis]);
+    distance_to_edge[axis][1] = std::abs(lidar_position(axis) - fastlio_local_map_points_.vertex_max[axis]);
+    if (distance_to_edge[axis][0] <= kFastLioMoveThreshold * detection_range ||
+        distance_to_edge[axis][1] <= kFastLioMoveThreshold * detection_range)
+    {
+      move_required = true;
+    }
+  }
+  if (!move_required || fastlio_ikdtree_.Root_Node == nullptr) return;
+
+  BoxPointType new_local_map = fastlio_local_map_points_;
+  std::vector<BoxPointType> boxes_to_remove;
+  const double move_distance =
+      std::max((cube_side_length - 2.0 * kFastLioMoveThreshold * detection_range) * 0.5 * 0.9,
+               detection_range * (kFastLioMoveThreshold - 1.0));
+
+  for (int axis = 0; axis < 3; ++axis)
+  {
+    BoxPointType removal_box = fastlio_local_map_points_;
+    if (distance_to_edge[axis][0] <= kFastLioMoveThreshold * detection_range)
+    {
+      new_local_map.vertex_min[axis] -= static_cast<float>(move_distance);
+      new_local_map.vertex_max[axis] -= static_cast<float>(move_distance);
+      removal_box.vertex_min[axis] = fastlio_local_map_points_.vertex_max[axis] - static_cast<float>(move_distance);
+      boxes_to_remove.push_back(removal_box);
+    }
+    else if (distance_to_edge[axis][1] <= kFastLioMoveThreshold * detection_range)
+    {
+      new_local_map.vertex_min[axis] += static_cast<float>(move_distance);
+      new_local_map.vertex_max[axis] += static_cast<float>(move_distance);
+      removal_box.vertex_max[axis] = fastlio_local_map_points_.vertex_min[axis] + static_cast<float>(move_distance);
+      boxes_to_remove.push_back(removal_box);
+    }
+  }
+  fastlio_local_map_points_ = new_local_map;
+
+  PointVector removed_points;
+  fastlio_ikdtree_.acquire_removed_points(removed_points);
+  if (!boxes_to_remove.empty()) fastlio_ikdtree_.Delete_Point_Boxes(boxes_to_remove);
+}
+
+void VoxelMapManager::UpdateFastLioMap(const PointCloudXYZI::Ptr &world_cloud)
+{
+  if (config_setting_.correspondence_mode_ != "fastlio_ikdtree" || world_cloud == nullptr || world_cloud->empty()) return;
+  if (fastlio_ikdtree_.Root_Node == nullptr)
+  {
+    BuildFastLioMap();
+    return;
+  }
+
+  PointVector points_to_add;
+  PointVector points_without_downsampling;
+  points_to_add.reserve(world_cloud->size());
+  points_without_downsampling.reserve(world_cloud->size());
+  const float filter_size = static_cast<float>(config_setting_.fastlio_filter_size_map_);
+
+  for (size_t i = 0; i < world_cloud->size(); ++i)
+  {
+    const PointType &point = world_cloud->points[i];
     if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) continue;
 
-    const V3D position(point.x, point.y, point.z);
-    const VOXEL_LOCATION voxel = worldToVoxelLocation(position, voxel_size);
-    const V3D center((static_cast<double>(voxel.x) + 0.5) * voxel_size,
-                     (static_cast<double>(voxel.y) + 0.5) * voxel_size,
-                     (static_cast<double>(voxel.z) + 0.5) * voxel_size);
-    const double candidate_distance = (position - center).squaredNorm();
-
-    const auto existing = knn_map_voxels_.find(voxel);
-    if (existing == knn_map_voxels_.end())
+    bool need_add = true;
+    if (i < fastlio_nearest_points_.size() && !fastlio_nearest_points_[i].empty())
     {
-      knn_map_voxels_.emplace(voxel, point);
-      continue;
-    }
+      const PointVector &nearby_points = fastlio_nearest_points_[i];
+      PointType voxel_center;
+      voxel_center.x = std::floor(point.x / filter_size) * filter_size + 0.5f * filter_size;
+      voxel_center.y = std::floor(point.y / filter_size) * filter_size + 0.5f * filter_size;
+      voxel_center.z = std::floor(point.z / filter_size) * filter_size + 0.5f * filter_size;
+      const auto squared_distance = [](const PointType &lhs, const PointType &rhs) {
+        const float dx = lhs.x - rhs.x;
+        const float dy = lhs.y - rhs.y;
+        const float dz = lhs.z - rhs.z;
+        return dx * dx + dy * dy + dz * dz;
+      };
+      const float candidate_distance = squared_distance(point, voxel_center);
 
-    const V3D existing_position(existing->second.x, existing->second.y, existing->second.z);
-    if (candidate_distance < (existing_position - center).squaredNorm())
-    {
-      existing->second = point;
+      if (std::abs(nearby_points[0].x - voxel_center.x) > 0.5f * filter_size &&
+          std::abs(nearby_points[0].y - voxel_center.y) > 0.5f * filter_size &&
+          std::abs(nearby_points[0].z - voxel_center.z) > 0.5f * filter_size)
+      {
+        points_without_downsampling.push_back(point);
+        continue;
+      }
+
+      for (int neighbor = 0; neighbor < kFastLioNumMatchPoints; ++neighbor)
+      {
+        if (nearby_points.size() < static_cast<size_t>(kFastLioNumMatchPoints)) break;
+        if (squared_distance(nearby_points[neighbor], voxel_center) < candidate_distance)
+        {
+          need_add = false;
+          break;
+        }
+      }
     }
+    if (need_add) points_to_add.push_back(point);
   }
 
-  rebuildKnnIndex();
+  fastlio_ikdtree_.Add_Points(points_to_add, true);
+  fastlio_ikdtree_.Add_Points(points_without_downsampling, false);
 }
 
-void VoxelMapManager::rebuildKnnIndex()
+bool VoxelMapManager::estimateFastLioPlane(const PointVector &points, V3D &normal, double &d, V3D &center) const
 {
-  knn_map_cloud_->clear();
-  knn_map_cloud_->reserve(knn_map_voxels_.size());
-  for (const auto &entry : knn_map_voxels_)
-  {
-    knn_map_cloud_->push_back(entry.second);
-  }
+  if (points.size() != static_cast<size_t>(kFastLioNumMatchPoints)) return false;
 
-  if (std::getenv("FAST_LIVO2_DETERMINISTIC") != nullptr)
-  {
-    std::sort(knn_map_cloud_->points.begin(), knn_map_cloud_->points.end(), [](const PointType &lhs, const PointType &rhs) {
-      if (lhs.x != rhs.x) return lhs.x < rhs.x;
-      if (lhs.y != rhs.y) return lhs.y < rhs.y;
-      return lhs.z < rhs.z;
-    });
-  }
-
-  knn_map_cloud_->width = static_cast<uint32_t>(knn_map_cloud_->size());
-  knn_map_cloud_->height = 1;
-  knn_map_cloud_->is_dense = true;
-  knn_kdtree_->setInputCloud(knn_map_cloud_);
-}
-
-bool VoxelMapManager::estimateKnnPlane(const std::vector<int> &point_indices, V3D &normal, double &d, V3D &center) const
-{
-  const int point_count = static_cast<int>(point_indices.size());
-  if (point_count != config_setting_.knn_num_match_points_) return false;
-
-  Eigen::MatrixXd coordinates(point_count, 3);
+  Eigen::Matrix<double, kFastLioNumMatchPoints, 3> coordinates;
   center.setZero();
-  for (int i = 0; i < point_count; ++i)
+  for (int i = 0; i < kFastLioNumMatchPoints; ++i)
   {
-    const PointType &point = knn_map_cloud_->points[point_indices[i]];
+    const PointType &point = points[i];
+    if (!std::isfinite(point.x) || !std::isfinite(point.y) || !std::isfinite(point.z)) return false;
     coordinates.row(i) << point.x, point.y, point.z;
     center += V3D(point.x, point.y, point.z);
   }
-  center /= static_cast<double>(point_count);
+  center /= static_cast<double>(kFastLioNumMatchPoints);
 
-  const Eigen::VectorXd rhs = Eigen::VectorXd::Constant(point_count, -1.0);
+  const Eigen::Matrix<double, kFastLioNumMatchPoints, 1> rhs =
+      Eigen::Matrix<double, kFastLioNumMatchPoints, 1>::Constant(-1.0);
   const V3D unnormalized_normal = coordinates.colPivHouseholderQr().solve(rhs);
   const double normal_norm = unnormalized_normal.norm();
   if (!std::isfinite(normal_norm) || normal_norm < 1e-9) return false;
 
   normal = unnormalized_normal / normal_norm;
   d = 1.0 / normal_norm;
-  for (int i = 0; i < point_count; ++i)
+  for (int i = 0; i < kFastLioNumMatchPoints; ++i)
   {
-    if (std::abs(normal.dot(coordinates.row(i).transpose()) + d) > config_setting_.knn_plane_threshold_)
-    {
-      return false;
-    }
+    if (std::abs(normal.dot(coordinates.row(i).transpose()) + d) > kFastLioPlaneThreshold) return false;
   }
   return true;
 }
 
-void VoxelMapManager::BuildResidualListKNN(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list,
-                                           const bool recompute_neighbors)
+void VoxelMapManager::BuildResidualListFastLio(std::vector<pointWithVar> &pv_list,
+                                                std::vector<PointToPlane> &ptpl_list,
+                                                const bool recompute_neighbors, const int iteration)
 {
+  using MatchStatus = fast_livo2::diagnostics::MatchStatus;
+  const bool capture = lio_diagnostics_.geometryEnabled();
+  const bool evaluate_normals = !source_normals_.empty();
+  normal_stats_.comparisons = normal_stats_.rejected = 0;
+  lio_diagnostics_.normalStats(normal_stats_);
   ptpl_list.clear();
-  if (knn_map_cloud_->size() < static_cast<size_t>(config_setting_.knn_num_match_points_)) return;
+  if (fastlio_ikdtree_.validnum() < kFastLioNumMatchPoints)
+  {
+    if (capture) for (auto &point : diagnostic_geometry_) point.status = MatchStatus::InsufficientNeighbors;
+    return;
+  }
 
+  std::vector<uint8_t> compared(evaluate_normals ? pv_list.size() : 0, 0);
+  std::vector<uint8_t> rejected(evaluate_normals ? pv_list.size() : 0, 0);
   std::vector<PointToPlane> candidates(pv_list.size());
   std::vector<uint8_t> useful(pv_list.size(), 0);
 
@@ -907,6 +1283,14 @@ void VoxelMapManager::BuildResidualListKNN(std::vector<pointWithVar> &pv_list, s
   for (int i = 0; i < static_cast<int>(pv_list.size()); ++i)
   {
     pointWithVar &pv = pv_list[i];
+    auto *record = capture ? &diagnostic_geometry_[i] : nullptr;
+    if (!pv.point_b.allFinite() || !pv.point_w.allFinite())
+    {
+      fastlio_neighbor_valid_[i] = 0;
+      fastlio_nearest_points_[i].clear();
+      continue;
+    }
+
     PointType query;
     query.x = static_cast<float>(pv.point_w.x());
     query.y = static_cast<float>(pv.point_w.y());
@@ -914,29 +1298,62 @@ void VoxelMapManager::BuildResidualListKNN(std::vector<pointWithVar> &pv_list, s
 
     if (recompute_neighbors)
     {
-      std::vector<int> point_indices(config_setting_.knn_num_match_points_);
-      std::vector<float> squared_distances(config_setting_.knn_num_match_points_);
-      const int found =
-          knn_kdtree_->nearestKSearch(query, config_setting_.knn_num_match_points_, point_indices, squared_distances);
-      knn_nearest_indices_[i] = std::move(point_indices);
-      knn_neighbor_valid_[i] =
-          found == config_setting_.knn_num_match_points_ &&
-          squared_distances.back() <= config_setting_.knn_max_neighbor_sq_dist_;
+      std::vector<float> squared_distances;
+      fastlio_nearest_points_[i].clear();
+      fastlio_ikdtree_.Nearest_Search(query, kFastLioNumMatchPoints,
+                                      fastlio_nearest_points_[i], squared_distances);
+      fastlio_neighbor_valid_[i] =
+          fastlio_nearest_points_[i].size() == static_cast<size_t>(kFastLioNumMatchPoints) &&
+          squared_distances.size() == static_cast<size_t>(kFastLioNumMatchPoints) &&
+          squared_distances[kFastLioNumMatchPoints - 1] <= kFastLioMaxNeighborSquaredDistance;
+      if (record)
+      {
+        record->search_world = V3D(query.x, query.y, query.z);
+        record->search_iteration = iteration;
+        record->search_farthest_squared = squared_distances.empty() ? 0.0 : squared_distances.back();
+      }
     }
-    if (knn_neighbor_valid_[i] == 0) continue;
-
-    const std::vector<int> &point_indices = knn_nearest_indices_[i];
+    if (fastlio_neighbor_valid_[i] == 0)
+    {
+      if (record) record->status = fastlio_nearest_points_[i].size() < kFastLioNumMatchPoints ?
+          MatchStatus::InsufficientNeighbors : MatchStatus::NeighborDistance;
+      continue;
+    }
 
     V3D normal;
     V3D center;
     double d = 0.0;
-    if (!estimateKnnPlane(point_indices, normal, d, center)) continue;
+    if (!estimateFastLioPlane(fastlio_nearest_points_[i], normal, d, center))
+    {
+      if (record) record->status = MatchStatus::PlaneFit;
+      continue;
+    }
 
     const double signed_distance = normal.dot(pv.point_w) + d;
     const double body_range = pv.point_b.norm();
-    if (body_range <= 1e-9) continue;
+    if (record)
+    {
+      record->normal = normal; record->center = center; record->plane_d = d;
+      record->distance = signed_distance; record->status = MatchStatus::Residual;
+    }
+    if (!std::isfinite(signed_distance) || !std::isfinite(body_range) || body_range <= 1e-9) continue;
     const double score = 1.0 - 0.9 * std::abs(signed_distance) / std::sqrt(body_range);
-    if (score <= config_setting_.knn_residual_score_threshold_) continue;
+    if (score <= kFastLioResidualScoreThreshold) continue;
+
+    if (evaluate_normals)
+    {
+      // Reevaluate at every iteration even when the five map neighbors are cached.
+      const auto comparison = fast_livo2::normal_consistency::compare(
+          source_normals_[i], normal, state_.rot_end, extR_, config_setting_.normal_consistency_);
+      compared[i] = comparison.valid;
+      if (record) record->comparison = comparison;
+      if (config_setting_.normal_consistency_.enabled && comparison.mismatch)
+      {
+        rejected[i] = 1;
+        if (record) record->status = MatchStatus::NormalMismatch;
+        continue;
+      }
+    }
 
     PointToPlane &match = candidates[i];
     match.point_b_ = pv.point_b;
@@ -952,17 +1369,27 @@ void VoxelMapManager::BuildResidualListKNN(std::vector<pointWithVar> &pv_list, s
     match.dis_to_plane_ = static_cast<float>(signed_distance);
     pv.normal = normal;
     useful[i] = 1;
+    if (record) record->status = MatchStatus::Accepted;
   }
 
+  for (const auto value : compared) normal_stats_.comparisons += value;
+  for (const auto value : rejected) normal_stats_.rejected += value;
+  lio_diagnostics_.normalStats(normal_stats_);
   ptpl_list.reserve(pv_list.size());
   for (size_t i = 0; i < useful.size(); ++i)
   {
-    if (useful[i] != 0) ptpl_list.push_back(candidates[i]);
+    if (useful[i] != 0)
+    {
+      if (capture) diagnostic_geometry_[i].match_index = static_cast<int>(ptpl_list.size());
+      ptpl_list.push_back(candidates[i]);
+    }
   }
 }
 
 void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, std::vector<PointToPlane> &ptpl_list)
 {
+  using fast_livo2::diagnostics::MatchStatus;
+  const bool capture = lio_diagnostics_.geometryEnabled();
   double voxel_size = config_setting_.max_voxel_size_;
   const int neighbor_radius = config_setting_.neighbor_voxel_radius_;
   std::mutex mylock;
@@ -982,6 +1409,14 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   for (int i = 0; i < index.size(); i++)
   {
     pointWithVar &pv = pv_list[i];
+    auto *record = capture ? &diagnostic_geometry_[i] : nullptr;
+    if (record)
+    {
+      record->voxel.point_world_covariance = pv.var;
+      record->voxel.point_body_covariance = pv.body_var;
+    }
+    if (!pv.point_b.allFinite() || !pv.point_w.allFinite()) continue;
+    if (record) record->status = MatchStatus::NoVoxel;
     const VOXEL_LOCATION position = worldToVoxelLocation(pv.point_w, voxel_size);
     PointToPlane single_ptpl;
     bool is_sucess = false;
@@ -1000,7 +1435,8 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
           const auto iter = voxel_map_.find(candidate);
           if (iter != voxel_map_.end())
           {
-            build_single_residual(pv, iter->second, 0, is_sucess, prob, single_ptpl);
+            if (record && record->status == MatchStatus::NoVoxel) record->status = MatchStatus::NoPlane;
+            build_single_residual(pv, iter->second, 0, is_sucess, prob, single_ptpl, record, candidate);
           }
         }
       }
@@ -1022,13 +1458,20 @@ void VoxelMapManager::BuildResidualListOMP(std::vector<pointWithVar> &pv_list, s
   }
   for (size_t i = 0; i < useful_ptpl.size(); i++)
   {
-    if (useful_ptpl[i]) { ptpl_list.push_back(all_ptpl_list[i]); }
+    if (useful_ptpl[i])
+    {
+      all_ptpl_list[i].source_index_ = static_cast<int>(i);
+      if (capture) diagnostic_geometry_[i].match_index = static_cast<int>(ptpl_list.size());
+      ptpl_list.push_back(all_ptpl_list[i]);
+    }
   }
 }
 
 void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTree *current_octo, const int current_layer, bool &is_sucess,
-                                            double &prob, PointToPlane &single_ptpl)
+                                            double &prob, PointToPlane &single_ptpl,
+                                            fast_livo2::diagnostics::GeometryPoint *record, const VOXEL_LOCATION &root_voxel)
 {
+  using fast_livo2::diagnostics::MatchStatus;
   int max_layer = config_setting_.max_layer_;
   double sigma_num = config_setting_.sigma_num_;
 
@@ -1041,7 +1484,45 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
     float dis_to_plane = fabs(plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_);
     float dis_to_center = (plane.center_(0) - p_w(0)) * (plane.center_(0) - p_w(0)) + (plane.center_(1) - p_w(1)) * (plane.center_(1) - p_w(1)) +
                           (plane.center_(2) - p_w(2)) * (plane.center_(2) - p_w(2));
-    float range_dis = sqrt(dis_to_center - dis_to_plane * dis_to_plane);
+    // Roundoff at the plane center must not turn a zero tangential distance into NaN.
+    float range_dis = sqrt(std::max(0.0f, dis_to_center - dis_to_plane * dis_to_plane));
+    const auto record_candidate = [&](MatchStatus status, double plane_variance, double point_variance, double probability) {
+      if (!record) return;
+      const auto stage = [](MatchStatus s) {
+        switch (s)
+        {
+        case MatchStatus::Accepted: return 4;
+        case MatchStatus::Residual: return 3;
+        case MatchStatus::InvalidVariance: return 2;
+        case MatchStatus::OutsideExtent: return 1;
+        default: return 0;
+        }
+      };
+      const int next = stage(status), previous = stage(record->status);
+      if (next < previous) return;
+      if (next == previous && status != MatchStatus::Accepted)
+      {
+        if (status == MatchStatus::Residual && dis_to_plane / std::sqrt(plane_variance + point_variance) >=
+              record->voxel.gate_distance / std::sqrt(record->voxel.gate_variance)) return;
+        if (status == MatchStatus::OutsideExtent && range_dis / std::max(1e-15f, plane.radius_) >=
+              record->voxel.tangential_distance / std::max(1e-15, record->voxel.radius)) return;
+        if (status == MatchStatus::InvalidVariance) return;
+      }
+      record->status = status;
+      record->normal = plane.normal_; record->center = plane.center_;
+      record->plane_d = plane.d_;
+      record->distance = plane.normal_.dot(p_w) + plane.d_;
+      auto &v = record->voxel;
+      v.plane_valid = true; v.plane_id = plane.id_; v.layer = current_layer;
+      v.support_points = plane.points_size_; v.update_enabled = current_octo->update_enable_;
+      v.root_voxel = {root_voxel.x, root_voxel.y, root_voxel.z};
+      v.voxel_center = V3D(current_octo->voxel_center_[0], current_octo->voxel_center_[1], current_octo->voxel_center_[2]);
+      v.eigenvalues = V3D(plane.min_eigen_value_, plane.mid_eigen_value_, plane.max_eigen_value_);
+      v.plane_covariance = plane.plane_var_; v.radius = plane.radius_;
+      v.tangential_distance = range_dis; v.gate_distance = dis_to_plane;
+      v.gate_plane_variance = plane_variance; v.gate_point_variance = point_variance;
+      v.gate_variance = plane_variance + point_variance; v.probability = probability;
+    };
 
     if (range_dis <= radius_k * plane.radius_)
     {
@@ -1049,13 +1530,20 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
       J_nq.block<1, 3>(0, 0) = p_w - plane.center_;
       J_nq.block<1, 3>(0, 3) = -plane.normal_;
       double sigma_l = J_nq * plane.plane_var_ * J_nq.transpose();
-      sigma_l += plane.normal_.transpose() * pv.var * plane.normal_;
+      const double plane_variance = sigma_l;
+      const double point_variance = plane.normal_.transpose() * pv.var * plane.normal_;
+      sigma_l += point_variance;
+      if (!std::isfinite(sigma_l) || sigma_l <= 0.0 || !std::isfinite(dis_to_plane))
+      {
+        record_candidate(MatchStatus::InvalidVariance, plane_variance, point_variance, 0.0);
+        return;
+      }
       if (dis_to_plane < sigma_num * sqrt(sigma_l))
       {
-        is_sucess = true;
         double this_prob = 1.0 / (sqrt(sigma_l)) * exp(-0.5 * dis_to_plane * dis_to_plane / sigma_l);
-        if (this_prob > prob)
+        if (std::isfinite(this_prob) && this_prob > prob)
         {
+          is_sucess = true;
           prob = this_prob;
           pv.normal = plane.normal_;
           single_ptpl.body_cov_ = pv.body_var;
@@ -1067,18 +1555,19 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
           single_ptpl.d_ = plane.d_;
           single_ptpl.layer_ = current_layer;
           single_ptpl.dis_to_plane_ = plane.normal_(0) * p_w(0) + plane.normal_(1) * p_w(1) + plane.normal_(2) * p_w(2) + plane.d_;
+          record_candidate(MatchStatus::Accepted, plane_variance, point_variance, this_prob);
         }
         return;
       }
       else
       {
-        // is_sucess = false;
+        record_candidate(MatchStatus::Residual, plane_variance, point_variance, 0.0);
         return;
       }
     }
     else
     {
-      // is_sucess = false;
+      record_candidate(MatchStatus::OutsideExtent, 0.0, 0.0, 0.0);
       return;
     }
   }
@@ -1092,7 +1581,7 @@ void VoxelMapManager::build_single_residual(pointWithVar &pv, const VoxelOctoTre
         {
 
           VoxelOctoTree *leaf_octo = current_octo->leaves_[leafnum];
-          build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, prob, single_ptpl);
+          build_single_residual(pv, leaf_octo, current_layer + 1, is_sucess, prob, single_ptpl, record, root_voxel);
         }
       }
       return;

@@ -40,6 +40,7 @@ public:
   void set_acc_bias_cov(const V3D &b_a);
   void set_inv_expo_cov(const double &inv_expo);
   void set_imu_init_frame_num(const int &num);
+  void set_imu_init_duration(const double &duration_sec);
   void set_imu_stationary_thresholds(const double &gyr_mean_threshold,
                                      const double &gyr_std_threshold,
                                      const double &acc_std_ratio_threshold);
@@ -50,6 +51,7 @@ public:
   void Process2(LidarMeasureGroup &lidar_meas, StatesGroup &stat, PointCloudXYZI::Ptr cur_pcl_un_);
   void UndistortPcl(LidarMeasureGroup &lidar_meas, StatesGroup &state_inout, PointCloudXYZI &pcl_out);
 
+  void set_log_directory(const std::string &directory);
   ofstream fout_imu;
   double IMU_mean_acc_norm;
   V3D unbiased_gyr;
@@ -88,6 +90,9 @@ private:
   double stationary_gyr_mean_threshold = 0.1;
   double stationary_gyr_std_threshold = 0.02;
   double stationary_acc_std_ratio_threshold = 0.05;
+  double imu_init_duration_sec = 0.0;
+  double imu_init_start_time = -1.0;
+  double imu_init_end_time = -1.0;
   int init_iter_num = 0, MAX_INI_COUNT = 20;
   bool b_first_frame = true;
   bool imu_en = true;
